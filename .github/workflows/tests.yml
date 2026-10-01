@@ -27,11 +27,11 @@ jobs:
           .venv/bin/python -m pip install --only-binary=:all: --no-deps --target native/vendor imageio-ffmpeg==0.6.0
       - name: Build local app
         run: .venv/bin/python scripts/build-app.py
+      - name: Native window layout checks
+        run: bash scripts/test-layout.sh
       - name: Python fixtures
         run: .venv/bin/python -m pytest -q
       - name: Native logic checks
         run: sh scripts/test-native.sh
-      - name: Native window layout checks
-        run: bash scripts/test-layout.sh
       - name: Verify local signature
         run: codesign --verify --deep --strict native/build/AudioTranscribe.app

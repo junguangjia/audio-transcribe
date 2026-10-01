@@ -1,5 +1,26 @@
 import Cocoa
 
+final class BoundsContainingStackView: NSStackView {
+    var contentEdgeInsets = NSEdgeInsetsZero {
+        didSet { needsUpdateConstraints = true }
+    }
+
+    override func updateConstraints() {
+        // AppKit aligns controls by alignment rects. Older rounded buttons
+        // draw outside those rects, so reserve their visible frame overflow.
+        // Hidden controls add no padding to the collapsed accessory row.
+        let visibleInsets = views.filter { !$0.isHidden }.map(\.alignmentRectInsets)
+        let top = contentEdgeInsets.top + max(0, visibleInsets.map(\.top).max() ?? 0)
+        let bottom = contentEdgeInsets.bottom + max(0, visibleInsets.map(\.bottom).max() ?? 0)
+        if edgeInsets.top != top || edgeInsets.bottom != bottom ||
+            edgeInsets.left != contentEdgeInsets.left || edgeInsets.right != contentEdgeInsets.right {
+            edgeInsets = NSEdgeInsets(top: top, left: contentEdgeInsets.left,
+                                     bottom: bottom, right: contentEdgeInsets.right)
+        }
+        super.updateConstraints()
+    }
+}
+
 extension MainController {
     func buildThreePane() {
         guard let content = window?.contentView else { return }
@@ -59,8 +80,8 @@ extension MainController {
         // Prefer a collapsed empty row, but allow visible controls (compression
         // resistance 750) to give it their full height during cleanup.
         idleHeight.priority = NSLayoutConstraint.Priority(499); idleHeight.isActive = true
-        let cleanup = NSStackView(views: [cleanupStatus, cleanupSpacer, cleanupRetry, cleanupCancel]); cleanup.spacing = 8
-        cleanup.edgeInsets = NSEdgeInsets(top: 4, left: 12, bottom: 4, right: 12)
+        let cleanup = BoundsContainingStackView(views: [cleanupStatus, cleanupSpacer, cleanupRetry, cleanupCancel]); cleanup.spacing = 8
+        cleanup.contentEdgeInsets = NSEdgeInsets(top: 4, left: 12, bottom: 4, right: 12)
         // An empty horizontal spacer must not absorb the window's extra height.
         // The split view owns that space; accessory rows hug their controls.
         cleanup.setHuggingPriority(.required, for: .vertical)

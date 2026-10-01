@@ -1,5 +1,14 @@
 import Cocoa
 
+// Reproduce the legacy rounded-button frame seen on macOS 15 independently
+// of the host OS's current control metrics: a 20pt alignment rect in a 32pt frame.
+final class LegacyAlignmentButton: NSButton {
+    override var intrinsicContentSize: NSSize { NSSize(width: 74, height: 20) }
+    override var alignmentRectInsets: NSEdgeInsets {
+        NSEdgeInsets(top: 7, left: 6, bottom: 5, right: 6)
+    }
+}
+
 // These tests use the production AppKit view tree and isolated preferences.
 // The executable has no backend configuration, so bridge calls cannot launch
 // helpers. Folder restoration only watches a test-owned empty directory.
@@ -318,6 +327,31 @@ struct LayoutTests {
         check(defaults.string(forKey: "WatchedFolderPath") == directory.standardizedFileURL.path, "Saved watched folder path was replaced")
     }
 
+    static func cleanupAlignmentRegression(_ controller: MainController) {
+        guard let root = controller.window?.contentView,
+              let cleanup = stack(containing: controller.cleanupStatus, in: root) else {
+            fatalError("Missing cleanup row")
+        }
+        let button = LegacyAlignmentButton(title: "Synthetic cleanup", target: nil, action: nil)
+        button.bezelStyle = .rounded
+        cleanup.addArrangedSubview(button)
+        for visible in [true, false, true] {
+            button.isHidden = !visible
+            settle(controller)
+            if visible {
+                enclosed(button, in: cleanup, "legacy rounded cleanup button")
+                check(button.bounds.height >= 32 - tolerance, "Legacy fixture did not retain its full 32pt frame")
+                check(cleanup.bounds.height >= button.bounds.height + 8 - tolerance,
+                      "Cleanup row did not reserve its padding around the full button frame")
+            } else {
+                check(cleanup.bounds.height <= 12, "Legacy button left the hidden cleanup row expanded")
+            }
+        }
+        cleanup.removeArrangedSubview(button); button.removeFromSuperview()
+        settle(controller)
+        check(cleanup.bounds.height <= 12, "Removed legacy button left the cleanup row expanded")
+    }
+
     static func main() throws {
         let app = NSApplication.shared
         app.setActivationPolicy(.prohibited)
@@ -367,6 +401,7 @@ struct LayoutTests {
         controller.reader.labelsStack.isHidden = true; controller.reader.warning.isHidden = true; controller.reader.notice.isHidden = true
         measure(controller, name: "accessories-hidden-again", size: NSSize(width: 1450, height: 1100))
         measure(controller, name: "accessories-hidden-again-minimum", size: NSSize(width: 1150, height: 628))
+        cleanupAlignmentRegression(controller)
         try controllerRegressions()
         try watchedFolderDefaultsRegression()
         let report: [String: Any] = ["fixture": "synthetic-production-AppKit-view-tree", "production_services_started": false,
