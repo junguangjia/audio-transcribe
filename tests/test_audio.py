@@ -43,6 +43,115 @@ def samples(path):
         return np.frombuffer(source.readframes(source.getnframes()), dtype="<i2")
 
 
+@pytest.mark.parametrize("rate", [8000, 16000, 22050, 44100, 48000, 96000, 768000])
+@pytest.mark.parametrize("floating,bits", [(False, 16), (False, 24), (False, 32), (True, 32), (True, 64)])
+@pytest.mark.parametrize("channel", ["mean", "left", "right"])
+def test_streamed_pcm_matches_whole_array_oracle(tmp_path, monkeypatch, rate, floating, bits, channel):
+    """Retain the original whole-array DSP as an independent PCM oracle."""
+    monkeypatch.setattr(audio, "_RESAMPLE_BLOCK_SAMPLES", 2048)
+    monkeypatch.setattr(audio, "_RESAMPLE_MAX_OUTPUTS", 257)
+    rng = np.random.default_rng(rate + bits + floating)
+    values = rng.uniform(-0.2, 0.2, size=(2049, 2))
+    values[0] = [0.5, -0.25]
+    values[1024] = [-0.75, 0.5]
+    values[-1] = [0.375, -0.625]
+    path = wav_fixture(tmp_path / "源 with spaces.wav", values, rate=rate,
+                       bits=bits, floating=floating)
+    info = audio.inspect_audio(path)
+    mono = audio._mono(path, info, channel)
+    full = audio._resample(mono, rate)
+    ceiling = int(10 ** (-3 / 20) * 32768) / 32768
+    peak = float(np.abs(full).max())
+    gain_db = min(30.0, 20 * np.log10(ceiling / peak)) if peak else 0.0
+    expected = audio._write_pcm16(tmp_path / "old.wav", full * 10 ** (gain_db / 20))
+    actual = audio.prepare_audio(path, tmp_path / "new.wav", {"channel": channel})
+    assert (tmp_path / "old.wav").read_bytes() == (tmp_path / "new.wav").read_bytes()
+    assert actual["output_sha256"] == expected["output_sha256"]
+    assert actual["output_frames"] == len(full)
+    assert actual["gain_db"] == gain_db
+    assert actual["full_source_resampled_peak_dbfs"] == audio._db(peak)
+    assert actual["output_rms_dbfs"] == pytest.approx(expected["output_rms_dbfs"], abs=1e-12)
+
+
+@pytest.mark.parametrize("rate", [16000, 44100, 48000, 96000])
+def test_streamed_excerpt_keeps_source_relative_resample_phase(tmp_path, monkeypatch, rate):
+    monkeypatch.setattr(audio, "_RESAMPLE_MAX_OUTPUTS", 113)
+    rng = np.random.default_rng(rate)
+    values = rng.uniform(-0.3, 0.3, size=(rate // 2 + 37, 2))
+    path = wav_fixture(tmp_path / "source.wav", values, rate=rate)
+    info = audio.inspect_audio(path)
+    first, last = 43, len(values) - 71
+    mono = audio._mono(path, info, "mean")
+    excerpt = audio._resample(mono[first:last], rate)
+    expected = audio._write_pcm16(tmp_path / "old.wav", excerpt)
+    result = audio.prepare_audio(path, tmp_path / "new.wav",
+                                 policy={"gain_db": 0.0},
+                                 interval=(first / rate, last / rate))
+    assert (tmp_path / "old.wav").read_bytes() == (tmp_path / "new.wav").read_bytes()
+    assert result["output_sha256"] == expected["output_sha256"]
+    assert result["input_frame_start"] == first
+    assert result["input_frame_end"] == last
+
+
+@pytest.mark.parametrize("floating,bits", [(False, 24), (True, 64)])
+@pytest.mark.parametrize("rate", [44100, 768000])
+def test_streamed_64_channel_pcm_matches_whole_array_oracle(tmp_path, monkeypatch,
+                                                              floating, bits, rate):
+    monkeypatch.setattr(audio, "_RESAMPLE_MAX_OUTPUTS", 31)
+    rng = np.random.default_rng(rate + bits)
+    values = rng.uniform(-0.1, 0.1, size=(12000, 64))
+    values[0, :] = 0.0
+    values[-1, :] = 0.125
+    path = wav_fixture(tmp_path / "many-channels.wav", values, rate=rate,
+                       bits=bits, floating=floating)
+    info = audio.inspect_audio(path)
+    mono = audio._mono(path, info, "mean")
+    expected = audio._write_pcm16(tmp_path / "old.wav", audio._resample(mono, rate))
+    actual = audio.prepare_audio(path, tmp_path / "new.wav", {"gain_db": 0.0})
+    assert (tmp_path / "old.wav").read_bytes() == (tmp_path / "new.wav").read_bytes()
+    assert actual["output_sha256"] == expected["output_sha256"]
+
+
+def test_streamed_write_failure_removes_partial_derivative(tmp_path, monkeypatch):
+    path = wav_fixture(tmp_path / "source.wav", np.linspace(-0.2, 0.2, 48000), rate=48000)
+    original = audio._resampled_blocks
+    calls = 0
+
+    def failing_blocks(*args):
+        nonlocal calls
+        calls += 1
+        for block in original(*args):
+            yield block
+            if calls == 2:
+                raise OSError("simulated write-stage interruption")
+
+    monkeypatch.setattr(audio, "_resampled_blocks", failing_blocks)
+    with pytest.raises(OSError, match="write-stage interruption"):
+        audio.prepare_audio(path, tmp_path / "incomplete.wav")
+    assert not (tmp_path / "incomplete.wav").exists()
+
+
+def test_streamed_source_change_during_write_removes_derivative(tmp_path, monkeypatch):
+    path = wav_fixture(tmp_path / "source.wav", np.linspace(-0.2, 0.2, 48000), rate=16000)
+    original = audio._resampled_blocks
+    calls = 0
+
+    def changing_blocks(*args):
+        nonlocal calls
+        calls += 1
+        for block in original(*args):
+            yield block
+            if calls == 2:
+                with path.open("r+b") as stream:
+                    stream.seek(audio._parse(path)["data_offset"] + (48000 - 1) * 4)
+                    stream.write(struct.pack("<f", 0.0))
+
+    monkeypatch.setattr(audio, "_resampled_blocks", changing_blocks)
+    with pytest.raises(audio.AudioError, match="Source changed"):
+        audio.prepare_audio(path, tmp_path / "incomplete.wav")
+    assert not (tmp_path / "incomplete.wav").exists()
+
+
 @pytest.mark.parametrize("floating,bits", [(False, 16), (False, 24), (False, 32), (True, 32), (True, 64)])
 @pytest.mark.parametrize("extensible", [False, True])
 def test_supported_formats_ignore_metadata(tmp_path, floating, bits, extensible):

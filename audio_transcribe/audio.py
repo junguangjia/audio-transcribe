@@ -20,6 +20,8 @@ from scipy import ndimage, signal
 
 OUTPUT_RATE = 16_000
 _BLOCK_SAMPLES = 1_048_576
+_RESAMPLE_BLOCK_SAMPLES = 262_144
+_RESAMPLE_MAX_OUTPUTS = 65_536
 _KNOWN_ORPHAN_SHA256 = "97efb490c10fc2a066d7cca60bfa17e984e4bcd5b88c811322491cf8c7aab132"
 _KNOWN_ORPHAN_DATA_SIZE = 251_461_588
 _KNOWN_ORPHAN_FILE_SIZE = 251_461_632
@@ -135,21 +137,50 @@ def _verify_alignment(info, digest):
         raise AudioError(f"Frame misalignment: {info['orphan_bytes']} orphan byte(s). Only the exact verified supplied recording permits its four orphan bytes.")
 
 
-def _read_frames(stream, info, start, end):
+def _read_frames(stream, info, start, end, scratch=None, decoded=None):
     stream.seek(info["data_offset"] + start * info["block_align"])
     count = end - start
-    raw = stream.read(count * info["block_align"])
-    if len(raw) != count * info["block_align"]:
-        raise AudioError("Audio changed or became incomplete during reading.")
+    size = count * info["block_align"]
+    if scratch is None:
+        raw = stream.read(size)
+        if len(raw) != size:
+            raise AudioError("Audio changed or became incomplete during reading.")
+    else:
+        # Reusing the raw buffer avoids retaining one freed multi-megabyte
+        # allocation per source block in macOS's process heap. All decoded
+        # formats below copy to float64 before this buffer is reused.
+        raw = memoryview(scratch)[:size]
+        offset = 0
+        while offset < size:
+            received = stream.readinto(raw[offset:])
+            if not received:
+                raise AudioError("Audio changed or became incomplete during reading.")
+            offset += received
     bits = info["bits_per_sample"]
+    if decoded is not None:
+        result = decoded[:count]
+        target = result.reshape(-1)
     if info["format_code"] == 3:
-        result = np.frombuffer(raw, dtype="<f4" if bits == 32 else "<f8").astype(np.float64)
+        source = np.frombuffer(raw, dtype="<f4" if bits == 32 else "<f8")
+        if decoded is None:
+            result = source.astype(np.float64)
+        else:
+            np.copyto(target, source)
     elif bits == 24:
         octets = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3).astype(np.int32)
-        result = (octets[:, 0] | (octets[:, 1] << 8) | (octets[:, 2] << 16))
-        result = ((result ^ 0x800000) - 0x800000).astype(np.float64) / 8388608.0
+        converted = (octets[:, 0] | (octets[:, 1] << 8) | (octets[:, 2] << 16))
+        converted = ((converted ^ 0x800000) - 0x800000).astype(np.float64) / 8388608.0
+        if decoded is None:
+            result = converted
+        else:
+            np.copyto(target, converted)
     else:
-        result = np.frombuffer(raw, dtype="<i2" if bits == 16 else "<i4").astype(np.float64)
+        source = np.frombuffer(raw, dtype="<i2" if bits == 16 else "<i4")
+        if decoded is None:
+            result = source.astype(np.float64)
+        else:
+            np.copyto(target, source)
+            result = target
         result /= float(2 ** (bits - 1))
     result = result.reshape(count, info["channels"])
     if not np.isfinite(result).all():
@@ -171,13 +202,23 @@ def inspect_audio(path):
     cross = mono_square = mono_peak = 0.0
     cancellation_intervals = []
     block_frames = min(info["sample_rate"] * 5, _BLOCK_SAMPLES // channels)
+    scratch = bytearray(block_frames * info["block_align"])
+    decoded = np.empty((block_frames, channels), dtype=np.float64)
+    # Channel-contiguous columns let argmax(axis=0) scan without allocating a
+    # fresh frame-sized contiguous copy for every diagnostic block.
+    absolute_buffer = np.empty(decoded.shape, dtype=np.float64, order="F")
+    squared_buffer = np.empty_like(decoded)
+    mono_buffer = np.empty(block_frames, dtype=np.float64)
+    mono_absolute_buffer = np.empty(block_frames, dtype=np.float64)
+    boolean_buffer = np.empty((block_frames, channels), dtype=np.bool_)
     with Path(path).open("rb") as stream:
         for start in range(0, frames, block_frames):
             end = min(frames, start + block_frames)
-            values = _read_frames(stream, info, start, end)
-            absolute = np.abs(values)
+            values = _read_frames(stream, info, start, end, scratch, decoded)
+            absolute = np.abs(values, out=absolute_buffer[:end - start])
             with np.errstate(over="ignore", invalid="ignore"):
-                block_sums, block_squares = values.sum(axis=0), np.square(values).sum(axis=0)
+                block_sums = values.sum(axis=0)
+                block_squares = np.square(values, out=squared_buffer[:end - start]).sum(axis=0)
                 sums += block_sums
                 squares += block_squares
             if not np.isfinite(sums).all() or not np.isfinite(squares).all():
@@ -186,12 +227,12 @@ def inspect_audio(path):
             changed = block_peaks > peaks
             peak_frames[changed] = start + absolute.argmax(axis=0)[changed]
             peaks = np.maximum(peaks, block_peaks)
-            clips += (absolute >= 1.0).sum(axis=0)
-            zeros += (values == 0).sum(axis=0)
-            mono = values.mean(axis=1)
+            clips += np.greater_equal(absolute, 1.0, out=boolean_buffer[:end - start]).sum(axis=0)
+            zeros += np.equal(values, 0, out=boolean_buffer[:end - start]).sum(axis=0)
+            mono = np.mean(values, axis=1, out=mono_buffer[:end - start])
             block_mono_square = float(np.dot(mono, mono))
             mono_square += block_mono_square
-            mono_peak = max(mono_peak, float(np.abs(mono).max()))
+            mono_peak = max(mono_peak, float(np.abs(mono, out=mono_absolute_buffer[:end - start]).max()))
             if channels == 2:
                 block_cross = float(np.dot(values[:, 0], values[:, 1]))
                 cross += block_cross
@@ -288,10 +329,12 @@ def _mono(path, info, channel):
         raise AudioError("Right-channel selection requires at least two source channels.")
     result = np.empty(info["complete_frames"], dtype=np.float64)
     block_frames = min(262144, _BLOCK_SAMPLES // info["channels"])
+    scratch = bytearray(block_frames * info["block_align"])
+    decoded = np.empty((block_frames, info["channels"]), dtype=np.float64)
     with Path(path).open("rb") as stream:
         for first in range(0, len(result), block_frames):
             last = min(len(result), first + block_frames)
-            block = _read_frames(stream, info, first, last)
+            block = _read_frames(stream, info, first, last, scratch, decoded)
             result[first:last] = block.mean(axis=1) if channel == "mean" else block[:, 0 if channel == "left" else 1]
     return result
 
@@ -304,6 +347,53 @@ def _resample(values, rate):
     # time origin; it returns ceil(input_frames * up/down) samples.
     return signal.resample_poly(values, OUTPUT_RATE // divisor, rate // divisor,
                                 window=("kaiser", 5.0), padtype="constant")
+
+
+def _resampled_blocks(path, info, channel, start, end):
+    """Yield the old zero-padded polyphase result without a whole-file array.
+
+    Block starts are multiples of the reduced down factor, so each local
+    output has the same phase as scipy.signal.resample_poly on the complete
+    selected interval. The input halo exceeds the FIR's support on both sides;
+    actual interval edges retain scipy's constant-zero padding. This chunks
+    storage and processing only, never Whisper decoding.
+    """
+    if channel == "right" and info["channels"] < 2:
+        raise AudioError("Right-channel selection requires at least two source channels.")
+    rate = info["sample_rate"]
+    divisor = math.gcd(rate, OUTPUT_RATE)
+    up, down = OUTPUT_RATE // divisor, rate // divisor
+    input_frames = end - start
+    output_frames = (input_frames * up + down - 1) // down
+    # Keep decoded multichannel input bounded even at high sample rates.
+    block_outputs = max(16, min(_RESAMPLE_MAX_OUTPUTS,
+                                (_RESAMPLE_BLOCK_SAMPLES // info["channels"]) * up // down))
+    # scipy's default Kaiser FIR has half_len = 10 * max(up, down) in
+    # upsampled coordinates. Twice that source-domain radius is conservative
+    # and covers the filter plus all phase/padding positions.
+    halo = math.ceil(20 * max(up, down) / up) + 2
+    scratch = bytearray()
+    decoded = np.empty((0, info["channels"]), dtype=np.float64)
+    with Path(path).open("rb") as stream:
+        for first_output in range(0, output_frames, block_outputs):
+            last_output = min(output_frames, first_output + block_outputs)
+            first_input = max(0, (max(0, first_output * down // up - halo) // down) * down)
+            last_input = min(input_frames, (last_output - 1) * down // up + halo + 1)
+            required = (last_input - first_input) * info["block_align"]
+            if len(scratch) < required:
+                scratch = bytearray(required)
+            if len(decoded) < last_input - first_input:
+                decoded = np.empty((last_input - first_input, info["channels"]), dtype=np.float64)
+            values = _read_frames(stream, info, start + first_input, start + last_input,
+                                  scratch, decoded)
+            mono = (values.mean(axis=1) if channel == "mean"
+                    else values[:, 0 if channel == "left" else 1])
+            sampled = _resample(mono, rate)
+            local_first = first_output - first_input * up // down
+            block = sampled[local_first:local_first + last_output - first_output]
+            if len(block) != last_output - first_output:
+                raise AudioError("Resampled block was incomplete.")
+            yield block
 
 
 def _frame_max(values, frame_size=320):
@@ -397,6 +487,45 @@ def _write_pcm16(path, values):
             "output_rms_dbfs": _db(float(np.sqrt(np.mean(np.square(pcm.astype(np.float64) / 32768))))) }
 
 
+def _write_pcm16_blocks(path, blocks):
+    """Quantize and write bounded blocks with the existing PCM16 operation."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frames = 0
+    peak = 0
+    square_sum = 0
+    # x mode and exception cleanup preserve the no-overwrite contract.
+    with path.open("xb") as stream:
+        try:
+            with wave.open(stream, "wb") as writer:
+                writer.setnchannels(1)
+                writer.setsampwidth(2)
+                writer.setframerate(OUTPUT_RATE)
+                for values in blocks:
+                    if not np.isfinite(values).all():
+                        raise AudioError("Non-finite processing result; no derivative was written.")
+                    pcm = np.rint(np.clip(values, -1, 32767 / 32768) * 32768).astype("<i2")
+                    writer.writeframesraw(pcm.tobytes())
+                    integral = pcm.astype(np.int64)
+                    peak = max(peak, int(np.abs(integral).max()))
+                    square_sum += int(np.square(integral).sum())
+                    frames += len(pcm)
+            stream.flush()
+            os.fsync(stream.fileno())
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+    try:
+        digest = _hash(path)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return {"output_sha256": digest, "output_frames": frames,
+            "output_sample_rate": OUTPUT_RATE, "output_duration_seconds": frames / OUTPUT_RATE,
+            "output_peak_dbfs": _db(peak / 32768),
+            "output_rms_dbfs": _db(math.sqrt(square_sum / (frames * 32768 ** 2)))}
+
+
 def prepare_audio(source_path, output_path, policy=None, interval=None):
     """Create a new 16 kHz mono PCM16 derivative and return its provenance.
 
@@ -410,24 +539,49 @@ def prepare_audio(source_path, output_path, policy=None, interval=None):
     before = _fingerprint(source_path)
     info = inspect_audio(source_path)
     start, end = _interval(info, interval)
-    mono = _mono(source_path, info, selected["channel"])
-    full = _resample(mono, info["sample_rate"])
-    peak = float(np.abs(full).max())
+    if selected["candidate"] == "A":
+        peak = 0.0
+        for block in _resampled_blocks(source_path, info, selected["channel"], 0, info["complete_frames"]):
+            peak = max(peak, float(np.abs(block).max()))
+    else:
+        # The optional symmetric limiter remains on its original numerical
+        # path until its envelope and activity statistics can be streamed with
+        # the same whole-recording decisions.
+        mono = _mono(source_path, info, selected["channel"])
+        full = _resample(mono, info["sample_rate"])
+        peak = float(np.abs(full).max())
     ceiling = math.floor(10 ** (selected["peak_dbfs"] / 20) * 32768) / 32768
     safe_gain = min(selected["max_gain_db"], 20 * math.log10(ceiling / peak)) if peak else 0.0
     is_full = start == 0 and end == info["complete_frames"]
-    working = full if is_full else _resample(mono[start:end], info["sample_rate"])
-    del mono
     if selected["candidate"] == "A":
         gain_db = safe_gain if selected["gain_db"] is None else selected["gain_db"]
         if gain_db > safe_gain + 1e-9:
             raise AudioError("Candidate A explicit gain exceeds the full-source peak-safe gain.")
-        prepared = working * 10 ** (gain_db / 20)
+        gain = 10 ** (gain_db / 20)
         limiter = {"enabled": False, "latency_samples": 0, "automatic_makeup_gain": False,
                    "max_gain_reduction_db": 0.0, "limited_sample_fraction": 0.0}
-        if np.abs(prepared).max() > ceiling + 1e-12:
-            raise AudioError("Interval-boundary resampling exceeds the full-source calibrated ceiling; prepare the full derivative then use slice_pcm16.")
+
+        def prepared_blocks():
+            for block in _resampled_blocks(source_path, info, selected["channel"], start, end):
+                prepared = block * gain
+                if np.abs(prepared).max() > ceiling + 1e-12:
+                    raise AudioError("Interval-boundary resampling exceeds the full-source calibrated ceiling; prepare the full derivative then use slice_pcm16.")
+                yield prepared
+
+        if _fingerprint(source_path) != before or _hash(source_path) != info["sha256"]:
+            raise AudioError("Source changed during preparation; no derivative was written.")
+        output = _write_pcm16_blocks(output_path, prepared_blocks())
+        try:
+            unchanged = (_fingerprint(source_path) == before
+                         and _hash(source_path) == info["sha256"])
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            Path(output_path).unlink(missing_ok=True)
+            raise AudioError("Source changed during preparation; no derivative was written.")
     else:
+        working = full if is_full else _resample(mono[start:end], info["sample_rate"])
+        del mono
         requested = selected["gain_db"]
         if requested is None:
             if info["sha256"] != _KNOWN_ORPHAN_SHA256:
@@ -442,11 +596,11 @@ def prepare_audio(source_path, output_path, policy=None, interval=None):
             prepared, gain_db, limiter = _limit(working, gain_db, ceiling)
             limiter["full_source_calibration"] = full_metrics
         del full_limited
-    if not np.isfinite(prepared).all():
-        raise AudioError("Non-finite processing result; no derivative was written.")
-    if _fingerprint(source_path) != before or _hash(source_path) != info["sha256"]:
-        raise AudioError("Source changed during preparation; no derivative was written.")
-    output = _write_pcm16(output_path, prepared)
+        if not np.isfinite(prepared).all():
+            raise AudioError("Non-finite processing result; no derivative was written.")
+        if _fingerprint(source_path) != before or _hash(source_path) != info["sha256"]:
+            raise AudioError("Source changed during preparation; no derivative was written.")
+        output = _write_pcm16(output_path, prepared)
     duration = (end - start) / info["sample_rate"]
     return {
         "schema_version": 1, "source": info, "policy": selected,

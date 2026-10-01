@@ -6,8 +6,8 @@ or communication tools.
 
 The application uses whisper.cpp **v1.9.4**, commit
 `927cfce34f31707e17f2bff35c349632fb9e2c3a`. Its standard, non-quantized GGML
-`large-v3` is the provisional primary model. `large-v3-turbo` is the explicitly
-invoked speed comparator. They are multilingual models; the decoder is configured
+`large-v3-turbo` is the default model. `large-v3` remains an explicitly
+selected alternative. They are multilingual models; the decoder is configured
 with `en`, transcription rather than translation.
 
 ## Setup and recovery
@@ -15,7 +15,7 @@ with `en`, transcription rather than translation.
 From CODE_ROOT, create an isolated Python 3.12 environment if one does not exist.
 Install the pinned requirements and build requirements there as described in
 README.md. No global pip installation, PyTorch or model conversion is needed.
-The app build provisions its own FFmpeg decoder for non-WAV media. The private
+The explicit media-install step provisions the pinned FFmpeg decoder for non-WAV media; app builds do not download dependencies. The private
 machine-local manifest records actual dependency versions.
 
 ```sh
@@ -106,7 +106,8 @@ The installer records the local architecture, memory, OS and compiler versions
 in the private runtime manifest. It enables Metal for native arm64 builds.
 A compiler flag or successful build is not execution evidence:
 `runtime.build_info.metal_execution_verified` starts false. Inference-run logs
-must confirm the actual backend separately. Run one inference process at a time
-and release it at completion. Use a short pilot to measure elapsed time and
-memory pressure before a full recording. Do not upload machine-local manifests
+must confirm the actual backend separately. Serial mode runs one inference
+process; Auto admits up to three when current memory and swap checks allow it.
+Each process is released at completion. Use a short pilot to measure elapsed
+time and memory pressure before a full recording. Do not upload machine-local manifests
 or inference logs when contributing.

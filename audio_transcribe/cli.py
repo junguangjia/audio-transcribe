@@ -6,18 +6,23 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import signal
 import shutil
 import subprocess
 import sys
+import select
+import threading
 
 from .audio import inspect_audio
 from .media import inspect_media
 from .benchmark import evaluate_reference, run_benchmark
 from .config import create_profile, list_profiles, load_settings, resolve_config
 from .engine import load_runtime, now, run_session, verify_completed_run
-from .export import build_report, natural_order
+from .export import build_independent, build_report, natural_order
 from .library import library_request
+from .scheduler import BatchCoordinator
+from .execution import ExecutionOwner, OperationContext
 from .storage import (archive_session, import_sources, locate_session, read_doc,
                       restore_session, session_lock, validate_id, write_json, write_yaml)
 
@@ -50,10 +55,16 @@ def parser():
     report.add_argument("--model", choices=["large-v3", "large-v3-turbo"])
     report.add_argument("--channel", choices=["mean", "left", "right"])
     report.add_argument("--retry-failed", action="store_true", help="Retry failed inference while reusing intact successful sources.")
+    report.add_argument("--execution", choices=["auto", "serial", "pipeline"], help="Auto uses the measured preset with resource admission; serial uses one worker.")
+    report.add_argument("--asr-workers", type=int, choices=range(1, 10), help="Explicit capacity from 1 to 9; actual admission remains resource-bounded.")
     app_report = commands.add_parser("app-report", help="Native app bridge: ordered request JSON in, progress JSON lines out.")
     app_report.add_argument("--request", required=True)
     app_library = commands.add_parser("app-library", help="Local report library JSON bridge; no transcription or network access.")
     app_library.add_argument("--request", required=True)
+    app_transcribe = commands.add_parser("app-transcribe", help="Native app bridge: independent recordings with immediately readable results.")
+    app_transcribe.add_argument("--request", required=True)
+    app_results = commands.add_parser("app-results", help="Local independent-result JSON bridge; no transcription or network access.")
+    app_results.add_argument("--request", required=True)
     for name in ("benchmark", "pilot"):
         bench = commands.add_parser(name, help="Run an explicit bounded comparison." if name == "benchmark" else "Measure a short primary-model pilot before full transcription.")
         bench.add_argument("session_id")
@@ -152,6 +163,13 @@ def confirm_cli_order(files):
 
 
 def transcribe(settings, args):
+    def waiting(detail):
+        print("Waiting for AudioTranscribe execution ownership; Ctrl+C cancels this task.", file=sys.stderr, flush=True)
+    with ExecutionOwner(settings, progress=waiting) as owner:
+        return _transcribe_owned(settings, args, OperationContext(owner))
+
+
+def _transcribe_owned(settings, args, context):
     require_storage(settings)
     if args.session:
         if args.files or args.separate:
@@ -170,7 +188,7 @@ def transcribe(settings, args):
             args.order_confirmed = True
         # Validate every input before copying anything into permanent session storage.
         for path in args.files:
-            inspect_media(settings, Path(path).expanduser())
+            inspect_media(settings, Path(path).expanduser(), context=context)
         session_path, session, reused = import_sources(settings["roots"]["data"], args.files,
                                                       separate=args.separate, order_confirmed=args.order_confirmed)
     emit({"session_id": session["id"], "session_path": str(session_path), "sources": len(session["sources"]),
@@ -182,7 +200,7 @@ def transcribe(settings, args):
             session["profiles"] = resolved["selected_profiles"]
             write_yaml(session_path / "session.yaml", session, overwrite=True)
         return {"session_id": session["id"], "path": str(session_path), "state": "imported", "reused": reused}
-    return run_session(settings, session_path, resolved, force=args.force)
+    return run_session(settings, session_path, resolved, force=args.force, context=context)
 
 
 def native_dialog(code_root: Path, payload: dict) -> dict:
@@ -219,8 +237,15 @@ def report_command(settings, args):
                 raise ValueError("Order must contain each displayed row number once.")
             paths = [paths[n - 1] for n in order]
     resolved = assigned_config(settings, args)
+    execution = {}
+    if getattr(args, "execution", None):
+        execution["mode"] = args.execution
+    if getattr(args, "asr_workers", None):
+        execution["asr_workers"] = args.asr_workers
+        execution.setdefault("mode", "pipeline")
     return build_report(settings, paths, resolved, progress=lambda message: print(message, flush=True),
-                        **({"retry_failed": True} if getattr(args, "retry_failed", False) else {}))
+                        **({"retry_failed": True} if getattr(args, "retry_failed", False) else {}),
+                        **({"execution": execution} if execution else {}))
 
 
 def launch(settings):
@@ -245,24 +270,166 @@ def launch(settings):
 
 def app_report_command(settings, request_path):
     """No terminal dialogs, no transcript text on the native UI protocol."""
+    output_lock = threading.Lock()
     def event(value):
-        print(json.dumps(value, ensure_ascii=False), flush=True)
+        with output_lock:
+            print(json.dumps(value, ensure_ascii=False, allow_nan=False), flush=True)
+    coordinator = None
+    reader = None
     try:
         request = read_doc(Path(request_path))
         paths = request.get("files")
         if not isinstance(paths, list) or not paths or any(not isinstance(p, str) or not Path(p).is_absolute() for p in paths):
             raise ValueError("Choose at least one local recording.")
+        coordinator = BatchCoordinator(settings, paths, execution=request.get("execution"),
+                                       items=request.get("items"), batch_id=request.get("batch_id"), events=event,
+                                       submitted_monotonic=request.get("submitted_monotonic"))
+        if request.get("protocol_version") == 2:
+            coordinator.start()
+            reader = ControlReader(coordinator, sys.stdin)
+            reader.start()
         result = build_report(settings, paths, resolve_config(Path(settings["roots"]["data"])), events=event,
                               retry_failed=request.get("retry_failed") is True,
+                              coordinator=coordinator,
                               **({"groups": request["groups"]} if "groups" in request else {}))
-        event({"type": "result", **result})
+        coordinator.emit({"type": "result", **result, "report_id": result.get("batch_id")})
         return 1 if result["state"] == "partial" else 0
     except KeyboardInterrupt:
-        event({"type": "cancelled", "message": "Cancelled. Completed files are preserved. Click Transcribe to resume."})
+        if coordinator:
+            coordinator.cancel_batch()
+        (coordinator.emit if coordinator else event)({"type": "cancelled", "state": "cancelled", "stage": "cancelled",
+                "message": "Cancelled. Completed files are preserved. Click Transcribe to resume."})
         return 130
-    except (ValueError, OSError, RuntimeError, KeyError):
-        event({"type": "error", "message": "Processing could not start or finish. Check the files and available disk space, then retry. Local logs are preserved."})
+    except (ValueError, OSError, RuntimeError, KeyError, TypeError):
+        (coordinator.emit if coordinator else event)({"type": "error", "state": "failed", "stage": "finished",
+                "message": "Processing could not start or finish. Check the files and available disk space, then retry. Local logs are preserved."})
         return 2
+    finally:
+        if reader:
+            reader.close()
+
+
+def app_transcribe_command(settings, request_path):
+    """Normal app workflow: independent files, explicit model, no grouping UI."""
+    output_lock = threading.Lock()
+    def event(value):
+        with output_lock:
+            print(json.dumps(value, ensure_ascii=False, allow_nan=False), flush=True)
+    coordinator = None
+    reader = None
+    try:
+        require_storage(settings)
+        request = read_doc(Path(request_path))
+        if not isinstance(request, dict):
+            raise ValueError("Invalid transcription request.")
+        allowed = {"protocol_version", "batch_id", "submitted_monotonic", "files", "items",
+                   "model", "force", "retry_failed", "execution", "experimental_parallel", "thermal"}
+        if set(request) - allowed:
+            raise ValueError("Normal transcription accepts independent files only.")
+        paths = request.get("files")
+        if not isinstance(paths, list) or not paths or any(not isinstance(p, str) or not Path(p).is_absolute() for p in paths):
+            raise ValueError("Choose at least one local recording.")
+        for flag in ("force", "retry_failed", "experimental_parallel"):
+            if flag in request and type(request[flag]) is not bool:
+                raise ValueError("Transcription options must be boolean.")
+        model = request.get("model")
+        if model is not None and model not in {"large-v3", "large-v3-turbo"}:
+            raise ValueError("Choose an installed transcription model.")
+        execution = request.get("execution", {})
+        experimental = request.get("experimental_parallel") is True
+        if not isinstance(execution, dict):
+            raise ValueError("Execution preference must be a mapping.")
+        execution = dict(execution)
+        if experimental:
+            execution.setdefault("mode", "pipeline")
+            execution.setdefault("asr_workers", 2)
+        resolved = resolve_config(Path(settings["roots"]["data"]),
+                                  overrides={"asr": {"model": model}} if model else None)
+        coordinator = BatchCoordinator(settings, paths, execution=execution, items=request.get("items"),
+                                       batch_id=request.get("batch_id"), events=event,
+                                       submitted_monotonic=request.get("submitted_monotonic"))
+        items = request.get("items")
+        input_modes = ([item.get("input_mode", "managed") for item in items]
+                       if items is not None else ["managed"] * len(paths))
+        if any(mode not in {"managed", "referenced"} for mode in input_modes):
+            raise ValueError("Choose managed or referenced input for each recording.")
+        expected_version_keys = ([item.get("watched_version_key") for item in items]
+                                 if items is not None else [None] * len(paths))
+        for mode, key in zip(input_modes, expected_version_keys):
+            if key is not None and (mode != "referenced" or not isinstance(key, str)
+                                    or re.fullmatch(r"[0-9a-f]{64}", key) is None):
+                raise ValueError("Watched source version must be a verified referenced-file token.")
+        # Older native clients may include ``thermal``. It is intentionally
+        # ignored; temperature observations cannot affect normal execution.
+        if request.get("protocol_version") == 2:
+            coordinator.start()
+            reader = ControlReader(coordinator, sys.stdin)
+            reader.start()
+        result = build_independent(settings, paths, resolved, events=event,
+                                   retry_failed=request.get("retry_failed") is True,
+                                   force=request.get("force") is True, coordinator=coordinator,
+                                   experimental_parallel=experimental, input_modes=input_modes,
+                                   expected_version_keys=expected_version_keys)
+        coordinator.emit({"type": "result", **result})
+        if result["cancelled"] and not result["failed"]:
+            return 130
+        return 1 if result["state"] == "partial" else 0
+    except KeyboardInterrupt:
+        if coordinator:
+            coordinator.cancel_batch()
+        (coordinator.emit if coordinator else event)({"type": "cancelled", "state": "cancelled", "stage": "cancelled",
+                "message": "Cancelled. Completed results are preserved. Resume remaining recordings when ready."})
+        return 130
+    except (ValueError, OSError, RuntimeError, KeyError, TypeError):
+        (coordinator.emit if coordinator else event)({"type": "error", "state": "failed", "stage": "finished",
+                "message": "Processing could not start or finish. Check the files and available disk space, then retry. Completed results are preserved."})
+        return 2
+    finally:
+        if reader:
+            reader.close()
+
+
+class ControlReader:
+    """Finite, local stdin control channel. EOF means the owning UI went away."""
+    def __init__(self, coordinator, stream):
+        self.coordinator, self.stream = coordinator, stream
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="audio-controls", daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def _run(self):
+        pending = b""
+        try:
+            descriptor = self.stream.fileno()
+            while not self.stopped.is_set():
+                readable, _, _ = select.select([descriptor], [], [], 0.25)
+                if not readable:
+                    continue
+                chunk = os.read(descriptor, 65536)
+                if not chunk:
+                    if not self.stopped.is_set():
+                        self.coordinator.cancel_batch()
+                    return
+                pending += chunk
+                if len(pending) > 65536:
+                    self.coordinator.cancel_batch()
+                    return
+                lines = pending.split(b"\n")
+                pending = lines.pop()
+                for line in lines:
+                    try:
+                        self.coordinator.control(json.loads(line))
+                    except (ValueError, TypeError, UnicodeError):
+                        continue
+        except (OSError, ValueError, AttributeError):
+            if not self.stopped.is_set():
+                self.coordinator.cancel_batch()
+
+    def close(self):
+        self.stopped.set()
+        self.thread.join(timeout=1)
 
 
 def app_library_command(settings, request_path):
@@ -272,6 +439,17 @@ def app_library_command(settings, request_path):
         return 0
     except (ValueError, OSError, RuntimeError, KeyError, TypeError):
         emit({"type": "error", "message": "The local library request could not be completed. Check the selected report or recording metadata."})
+        return 2
+
+
+def app_results_command(settings, request_path):
+    """Explicit read/export/label channel, separate from progress events."""
+    from .direct import direct_request
+    try:
+        emit(direct_request(settings, read_doc(Path(request_path))))
+        return 0
+    except (ValueError, OSError, RuntimeError, KeyError, TypeError):
+        emit({"type": "error", "message": "The result request could not be completed. Check the selected result or export location."})
         return 2
 
 
@@ -295,6 +473,10 @@ def main(argv=None):
             return app_report_command(settings, args.request)
         if args.command == "app-library":
             return app_library_command(settings, args.request)
+        if args.command == "app-transcribe":
+            return app_transcribe_command(settings, args.request)
+        if args.command == "app-results":
+            return app_results_command(settings, args.request)
         if args.command == "transcribe":
             result = transcribe(settings, args)
         elif args.command == "report":

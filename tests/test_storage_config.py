@@ -165,7 +165,7 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(settings["storage_approved"])
         self.assertFalse(settings["settings_exists"])
         result = config.resolve_config(self.root)
-        self.assertEqual(result["asr"]["model"], "large-v3")
+        self.assertEqual(result["asr"]["model"], "large-v3-turbo")
         self.assertEqual(result["glossary"]["terms"], [])
         self.assertEqual(result["selected_profiles"]["speaker"], None)
 

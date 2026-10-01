@@ -118,6 +118,9 @@ final class LibraryClient {
                 process.executableURL = URL(fileURLWithPath: root).appendingPathComponent(".venv/bin/python")
                 process.arguments = ["-m", "audio_transcribe", "app-library", "--request", request.path]
                 process.currentDirectoryURL = URL(fileURLWithPath: root)
+                var environment = ProcessInfo.processInfo.environment
+                if let path = Bundle.main.object(forInfoDictionaryKey: "AudioTranscribeSettingsPath") as? String { environment["AUDIO_TRANSCRIBE_SETTINGS"] = path }
+                process.environment = environment
                 process.standardInput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
                 process.standardOutput = output
                 try process.run()

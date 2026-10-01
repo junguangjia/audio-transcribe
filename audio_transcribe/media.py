@@ -13,9 +13,12 @@ from pathlib import Path
 import signal
 import subprocess
 import uuid
+import time
+import contextlib
 
 from .audio import inspect_audio
 from .storage import _file_lock, read_doc, sha256_file, write_json
+from .execution import cancellable_file_lock
 
 EXTENSIONS = {"wav", "wave", "m4a", "mp3", "flac", "aac", "aiff", "aif", "aifc", "ogg", "oga", "opus", "mp4", "mov"}
 DECODE_VERSION = "first-audio-original-rate-float32-v1"
@@ -37,8 +40,10 @@ def decoder_identity():
     return {**result, "path": str(binary)}
 
 
-def decode_media(settings, path):
+def decode_media(settings, path, *, context=None):
     """Return an intact cached PCM working file and technical provenance."""
+    if context:
+        context.check_cancelled()
     path = Path(path).expanduser().absolute()
     if not path.is_file():
         raise MediaError("File is missing or unavailable. Reconnect its drive or choose it again.")
@@ -51,7 +56,11 @@ def decode_media(settings, path):
     cache = Path(settings["roots"]["cache"]) / "decoded-media"
     cache.mkdir(parents=True, exist_ok=True)
     target = cache / key
-    with _file_lock(cache / (key + ".lock")):
+    lock_path = cache / (key + ".lock")
+    with (cancellable_file_lock(lock_path, context, stage="waiting_for_preparation")
+          if context else _file_lock(lock_path)):
+        from .lifecycle import assert_decoded_cache_available
+        assert_decoded_cache_available(settings, key)
         receipt = target / "decode.json"
         wav = target / "audio.wav"
         if receipt.is_file():
@@ -71,25 +80,40 @@ def decode_media(settings, path):
         if Path("/usr/bin/sandbox-exec").exists():
             command = ["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)(deny network*)"] + args
         write_json(stage / "invocation.json", {"args": args, "identity": identity})
-        child = None
-        with (stage / "decoder.log").open("wb") as log:
-            try:
-                child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                         start_new_session=True)
-                child.wait()
-                if child.returncode:
-                    raise MediaError("Audio could not be decoded. The file may be damaged, encrypted, unsupported, or contain no audio track.")
-            except BaseException:
-                if child is not None and child.poll() is None:
-                    os.killpg(child.pid, signal.SIGTERM)
-                    try:
-                        child.wait(timeout=8)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(child.pid, signal.SIGKILL)
+        with context.heavy("audio_decode") if context else contextlib.nullcontext():
+            child = None
+            with (stage / "decoder.log").open("wb") as log:
+                try:
+                    if context:
+                        child = context.owner.spawn(command, stdout=log, stderr=log, output_dir=stage)
+                        with context.span("audio_decode"):
+                            while child.poll() is None:
+                                context.check_cancelled()
+                                time.sleep(0.2)
+                    else:
+                        child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                                 start_new_session=True)
                         child.wait()
-                raise
+                    if child.returncode:
+                        raise MediaError("Audio could not be decoded. The file may be damaged, encrypted, unsupported, or contain no audio track.")
+                except BaseException:
+                    if context and child is not None:
+                        with contextlib.suppress(Exception):
+                            child.cancel()
+                    elif child is not None and child.poll() is None:
+                        os.killpg(child.pid, signal.SIGTERM)
+                        try:
+                            child.wait(timeout=8)
+                        except subprocess.TimeoutExpired:
+                            os.killpg(child.pid, signal.SIGKILL)
+                            child.wait()
+                    raise
         try:
-            decoded = inspect_audio(stage / "audio.wav")
+            if context:
+                from .compute import run_audio_operation
+                decoded = run_audio_operation(settings, context, "inspect", stage / "audio.wav")
+            else:
+                decoded = inspect_audio(stage / "audio.wav")
         except ValueError:
             raise MediaError("Decoded audio could not be validated. This backend currently requires RIFF/WAVE working files below the RIFF size limit.") from None
         if sha256_file(path) != original_hash:
@@ -111,16 +135,20 @@ def decode_media(settings, path):
         return wav, saved
 
 
-def working_source(settings, path):
+def working_source(settings, path, *, context=None):
     path = Path(path).expanduser()
     if path.suffix.lower() in {".wav", ".wave"}:
         return path, None
-    return decode_media(settings, path)
+    return decode_media(settings, path, context=context)
 
 
-def inspect_media(settings, path):
-    working, media = working_source(settings, path)
-    info = inspect_audio(working)
+def inspect_media(settings, path, *, context=None):
+    working, media = working_source(settings, path, context=context)
+    if context:
+        from .compute import run_audio_operation
+        info = run_audio_operation(settings, context, "inspect", working)
+    else:
+        info = inspect_audio(working)
     if media:
         info.update(sha256=media["original_sha256"], size_bytes=media["original_size_bytes"], media_decode=media)
     return info
