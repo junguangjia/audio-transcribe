@@ -5,12 +5,14 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import wave
 from types import SimpleNamespace
 
 from audio_transcribe import engine, export, timeline
 from audio_transcribe.evaluation import timestamp
+from audio_transcribe.execution import ExecutionOwner, OperationContext
+from audio_transcribe.thermal import ThermalController
 
 
 def native(*pairs):
@@ -111,15 +113,30 @@ class TimelineTests(unittest.TestCase):
                     self.calls+=1
                     return None if self.calls==1 else 0
             def popen(*args,**kwargs):
+                command = args[0]
+                Path(command[command.index('--receipt')+1]).write_text(json.dumps({
+                    'nonce': command[command.index('--nonce')+1], 'state': 'reaped', 'returncode': 0}))
                 (out/'native.json').write_text(json.dumps(native((0,1000))))
                 kwargs['stderr'].write(b'main: processing fixture (16000 samples, 1 sec)\n');kwargs['stderr'].flush()
                 return Child()
-            with patch.object(engine.subprocess,'Popen',side_effect=popen),patch.object(engine,'memory_snapshot',return_value={}),patch.object(engine.subprocess,'run',return_value=SimpleNamespace(stdout='')),patch.object(engine.time,'monotonic',side_effect=[0,7201,7202]),patch.object(engine.time,'sleep'),patch.object(engine,'backend_evidence',return_value={'metal_observed':True}):
+            settings={'roots':{'app':str(root/'app')}}
+            thermal=ThermalController(clock=lambda:100,monitor=False)
+            thermal.ingest({'state':'nominal','seq':1,'monotonic':100},source='injected')
+            # Replace only this module's clock reference. Patching the shared
+            # time module would consume the elapsed fixture in owner admission
+            # or thermal freshness checks rather than the decoder deadline.
+            decoder_time=SimpleNamespace(monotonic=Mock(side_effect=[0,7201,7202]),sleep=Mock())
+            with ExecutionOwner(settings,thermal=thermal) as owner, \
+                    patch.object(engine.subprocess,'Popen',side_effect=popen) as process, \
+                    patch.object(engine,'memory_snapshot',side_effect=AssertionError('No ordinary profiling')), \
+                    patch.object(engine,'time',decoder_time), \
+                    patch.object(engine,'backend_evidence',return_value={'metal_observed':True}):
                 # No real process is spawned: the elapsed-wall-time fixture
                 # establishes that audio duration is not used as a cutoff.
-                # pid is only used for the mocked process-RSS query.
+                # pid identifies the mocked guardian only; ordinary profiling is disabled.
                 Child.pid=123
-                result=engine.decode({'roots':{'app':str(root/'app')}},{'runtime':{'cli':'/fixture','sha256':'runtime'}},{'path':'/fixture-model','sha256':'model'},wav,out,{'language':'en','threads':4,'beam_size':5,'temperature':0.0,'temperature_increment':0.2},{'terms':[]})
+                result=engine.decode(settings,{'runtime':{'cli':'/fixture','sha256':'runtime'}},{'path':'/fixture-model','sha256':'model'},wav,out,{'language':'en','threads':4,'beam_size':5,'temperature':0.0,'temperature_increment':0.2},{'terms':[]},context=OperationContext(owner))
+                process.assert_called_once()
             self.assertEqual(result['elapsed_seconds'],7202)
 
     def test_interrupted_cache_copy_never_publishes_partial_receipt(self):
@@ -127,7 +144,7 @@ class TimelineTests(unittest.TestCase):
             root=Path(tmp); old=root/"old"; logs=old/"logs/src"; logs.mkdir(parents=True)
             (old/"manifest.json").write_text("{}")
             (logs/"native.json").write_text("{}")
-            (logs/"complete.json").write_text("{}")
+            (logs/"complete.json").write_text(json.dumps({"native_sha256": engine.sha256_file(logs/"native.json")}))
             output=root/"new/logs/src"
             copyfile=engine.shutil.copyfile
             calls=0

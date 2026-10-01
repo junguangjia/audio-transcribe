@@ -12,12 +12,39 @@ import os
 from pathlib import Path
 
 from .storage import read_doc, validate_id, write_yaml
+from .product import DEFAULT_MODEL
 
 PROFILE_DIRECTORIES = {"speaker": "speakers", "capture": "captures", "glossary": "glossaries"}
 
 
 def defaults() -> dict:
-    return {"asr": {"model": "large-v3", "language": "en", "temperature": 0, "beam_size": 5, "temperature_increment": 0.2, "threads": 4, "max_context": 0}, "preprocessing": {"channel": "mean", "candidate": "A", "peak_dbfs": -3, "max_gain_db": 30, "gain_db": None, "vad": False, "filtering": "none"}}
+    return {"asr": {"model": DEFAULT_MODEL, "language": "en", "temperature": 0, "beam_size": 5, "temperature_increment": 0.2, "threads": 4, "max_context": 0}, "preprocessing": {"channel": "mean", "candidate": "A", "peak_dbfs": -3, "max_gain_db": 30, "gain_db": None, "vad": False, "filtering": "none"}}
+
+
+def execution_policy(settings=None, overrides=None, *, file_count=None):
+    """Scheduling preferences are deliberately outside the ASR/cache identity."""
+    result = {"mode": "auto", "asr_workers": 3, "prepare_workers": 1,
+              "prepared_ahead": 1, "resource_sampling": False}
+    for values in ((settings or {}).get("execution", {}), overrides or {}):
+        _unknown(values, result, "execution policy")
+        result.update(values)
+    if result["mode"] not in {"auto", "serial", "pipeline"}:
+        raise ValueError("execution.mode must be auto, serial, or pipeline.")
+    _number(result["asr_workers"], 1, 9, "execution.asr_workers", integral=True)
+    _number(result["prepare_workers"], 1, 4, "execution.prepare_workers", integral=True)
+    _number(result["prepared_ahead"], 1, 9, "execution.prepared_ahead", integral=True)
+    if type(result["resource_sampling"]) is not bool:
+        raise ValueError("execution.resource_sampling must be boolean.")
+    # The measured nine-file preset requests three decoders. Admission may
+    # conservatively hold extra slots without delaying the first worker.
+    result["effective_asr_workers"] = (1 if result["mode"] == "serial"
+                                       else min(result["asr_workers"], file_count)
+                                       if type(file_count) is int and file_count > 0
+                                       else result["asr_workers"])
+    result["effective_prepare_workers"] = 1 if result["mode"] == "serial" else result["prepare_workers"]
+    result["effective_prepared_ahead"] = 1 if result["mode"] == "serial" else result["prepared_ahead"]
+    result["pipeline"] = result["mode"] != "serial"
+    return result
 
 
 def _mapping(value, label):
@@ -92,7 +119,7 @@ def _canonical_hash(value):
 
 def _settings_defaults():
     home = Path.home()
-    return {"schema_version": 1, "roots": {"code": str(Path(__file__).resolve().parents[1]), "data": str(home / "AudioTranscription"), "app": str(home / "Library/Application Support/AudioTranscribe"), "cache": str(home / "Library/Caches/AudioTranscribe"), "log": str(home / "Library/Logs/AudioTranscribe")}, "runtime": {}, "models": {}, "storage_approval": None}
+    return {"schema_version": 1, "roots": {"code": str(Path(__file__).resolve().parents[1]), "data": str(home / "AudioTranscription"), "app": str(home / "Library/Application Support/AudioTranscribe"), "cache": str(home / "Library/Caches/AudioTranscribe"), "log": str(home / "Library/Logs/AudioTranscribe")}, "runtime": {}, "models": {}, "execution": {}, "storage_approval": None}
 
 
 def load_settings(path=None) -> dict:
@@ -114,6 +141,9 @@ def load_settings(path=None) -> dict:
         for key in ("runtime", "models"):
             if key in document:
                 result[key] = copy.deepcopy(_mapping(document[key], f"settings.{key}"))
+        if "execution" in document:
+            execution_policy(overrides=document["execution"])
+            result["execution"] = copy.deepcopy(document["execution"])
         approval = document.get("storage_approval")
         if approval is not None:
             _unknown(approval, {"data_root", "mode", "approved_at"}, "storage_approval")

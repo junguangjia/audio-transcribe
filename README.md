@@ -1,167 +1,49 @@
-# AudioTranscribe
+# AudioTranscribe 2.5.1
 
-A local macOS recording library and transcription app. Select recordings, confirm
-which belong together, and produce a self-contained Markdown transcript report.
-The native AppKit interface runs a Python pipeline backed by whisper.cpp and
-Whisper large-v3. No transcription service or account is required.
+The native three-pane app watches the selected local recording folder while it runs, then starts ready new files only when **开始全部新录音** is clicked. Dragged/chosen recordings remain managed-copy imports. Each file becomes an independent, readable result; the app does not infer course membership or combine recordings. The default model is the standard-precision `large-v3-turbo`. `large-v3` remains an explicit alternative.
 
-## Everyday use
+The default **Auto** mode uses a measured, bounded number of independent whisper.cpp processes for a multi-file batch. Admission checks current memory and swapping, and the app displays the requested/admitted count. **Serial** always requests one. The preparation lane is bounded; completed files publish without waiting for slower neighbors. Both modes retain cross-instance ownership, cancellation, result verification, exact-source cache reuse, and crash recovery. The application does not gate or cancel jobs based on macOS thermal state. macOS hardware and driver protections remain in place.
 
-1. Click **Import recordings / 导入录音**. New files appear immediately in
-   **Tasks / 任务**, which shows their count, order and processing status.
-2. Click **Start transcription / 开始转录**, review the class groups, and confirm.
-   Decoder progress stays in Tasks; Results also links back to the active task.
-3. Completion opens the full text inside **Transcripts / 转录结果**. The default
-   **Recently generated / 最近生成** view puts newly produced results first,
-   even when the recording date is older. Each row shows filenames and export time.
-4. Select **By recording date / 按录音日期** for chronological class organization.
-   Search matches filenames, titles and transcript text.
-5. Remove a file or clear the Tasks queue to change only that queue. To remove a
-   generated report from Results, select **Move to Recently Deleted / 移到最近删除**.
-   Restore it from **Recently Deleted / 最近删除** at any time. This action does
-   not erase source recordings or ASR artifacts and does not reclaim their storage.
+Open a result to play and seek its audio, read its complete timestamped transcript, or use Copy All. Export supports Markdown, TXT, SRT, and JSON and refuses to overwrite an existing file. Markdown and JSON carry `audiotranscribe/v1` provenance. Optional Course, Speaker, and Event / Topic labels may be added after transcription. Unknown recording clocks and timezones remain unknown.
 
-New imports after a completed task create a fresh queue. Pending tasks and their
-states are restored when reopening the app; interrupted processing resumes only
-when requested. **View this result / 查看本次结果** opens the current task's output
-inside the app; opening a report file in another application is a separate action.
+Watched-folder originals stay in place as external references; the app stores derived audio and results without a second full-size original copy. The saved text remains available if the source moves, while playback and retranscription require full-byte source verification or an explicit Locate File action. Deleting a watched result never deletes its external original; its current source version remains ignored until explicitly re-added or changed.
 
-Grouping is a suggestion, not speaker identification or proof that recordings
-belong to the same class. Unknown dates remain unknown. A complete batch report
-retains every selected source in order; a failed source has a visible entry.
-Class sections and the library provide dated views without joining source audio.
+Selected items can be permanently deleted from the list or detail view after one confirmation. The deletion coordinator waits for owned work and preserves external originals, saved exports, shared dependencies, models, and unselected items. Old incomplete results require an explicit retry; an upgrade never restarts them automatically.
 
-## Quality and repetition
+## Setup on macOS
 
-Long recordings can trigger Whisper feedback loops when generated text is reused
-as context for subsequent windows. The default clears prior decoded text context
-(`--max-context 0`). This changes decoding, not source audio. Temperature fallback
-remains enabled, and repeated phrases/alternating loops are checked after decoding.
-
-**Automatic checks are not an accuracy guarantee.** Results distinguish automatic
-checks passed, review required, and failure. Suspicious text remains available;
-it is never silently deleted or rewritten. Invalid timestamps are identified as
-unvalidated rather than causing all recognized text to disappear. Review flagged
-intervals against the original audio, especially names, numbers, technical terms
-and negation. Measure WER only against a human-verified, aligned reference.
-
-See [the quality approach](docs/QUALITY.md) for the reasoning, upstream references
-and limitations. There is no universal WER score for arbitrary classroom audio.
-
-## Install from source
-
-The native app targets macOS 13 or newer. The primary local inference path is
-Apple Silicon with Metal. Intel builds can use CPU decoding but are not the
-primary performance target. Keep sufficient memory and disk space for large-v3,
-working audio and immutable results.
-
-Prerequisites: Apple command-line developer tools (Swift and C/C++ toolchain),
-Python 3.12, and [uv](https://docs.astral.sh/uv/). From the cloned project:
+Requires macOS 13 or later, Xcode Command Line Tools, and Python 3.12. In a checkout, create an isolated environment and explicitly install the pinned dependencies:
 
 ```sh
-uv venv --seed --python 3.12 .venv
-uv pip install --python .venv/bin/python -r requirements-dev.txt -r requirements-build.txt
-.venv/bin/python scripts/setup-runtime.py
-./scripts/audio-transcribe configure --data-root ~/AudioTranscription --storage-mode local_alternative
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt -r requirements-build.txt
+.venv/bin/python -m pip install --only-binary=:all: --no-deps --target native/vendor imageio-ffmpeg==0.6.0
+.venv/bin/python scripts/setup-runtime.py --jobs 4
+```
+
+Dependency and model installation downloads from their upstream sources. Transcription stays local. Models live outside the checkout; see [RUNTIME.md](RUNTIME.md) for pinned versions and recovery commands.
+
+Choose a permanent local data directory before importing recordings. Do not assume Documents or Desktop is outside iCloud sync. For a deliberately chosen local directory:
+
+```sh
+.venv/bin/python -m audio_transcribe configure --data-root "$HOME/AudioTranscription" --storage-mode local_alternative
 .venv/bin/python scripts/build-app.py --install
+./Transcribe.command
 ```
 
-Runtime setup downloads and checks the pinned whisper.cpp revision plus standard
-F16 large-v3 and large-v3-turbo model files. The primary model is large-v3; model
-weights are several GB and are not part of this repository. The local build
-obtains a pinned `imageio-ffmpeg` binary in `native/vendor/` for non-WAV decoding.
-Initial setup requires network access; transcription runs locally.
+Existing settings and installed apps are preserved: neither command silently overwrites them. To try another build alongside an installed app, choose a different `--name` and `--bundle-id`, and open the reported app path. Keep the checkout, its `.venv`, and `native/vendor` available while an app refers to them. This is a source-linked local application, not a self-contained redistributable bundle.
 
-The app is built into `native/build/AudioTranscribe.app` and installed into
-`~/Applications/AudioTranscribe.app`. This source-build app refers to its checkout
-and `.venv`, so keep them in place or rebuild after moving them. It does not need
-a terminal to remain open. Local ad-hoc signing is used; this is not a notarized,
-self-contained binary distribution.
+The default icon is generated waveform artwork. An optional `--icon /path/to/image.png` is local customization; personal images, recordings, transcripts, settings, models and runtime manifests are excluded from this repository.
 
-An existing settings file is preserved. For a different configuration, place
-`--settings /path/settings.json` before the command, or set
-`AUDIO_TRANSCRIBE_SETTINGS`. Choose a local data folder explicitly; if intentionally
-using a synced folder, use `--storage-mode explicit_synced` after considering
-that audio and text will be synced by that service.
-
-## Supported media
-
-WAV/WAVE, M4A, MP3, FLAC, AAC, AIFF/AIF, OGG/Vorbis, OGG/Opus and audio-bearing
-MP4/MOV are accepted when the installed decoder supports their codec. The first
-audio stream is used. Video frames are not processed, and separate recordings
-are never concatenated before transcription. Corrupt or unsupported files fail
-individually without silently disappearing from the batch.
-
-Non-WAV sources are copied intact and decoded to a working WAV before per-file
-channel selection, measured gain and resampling. Measured frames determine
-duration. Original files are hash-checked and never modified. Identical selections
-remain explicit entries while sharing a valid matching transcription cache.
-
-## Dates and class groups
-
-Recording dates and start times are parsed conservatively from recognized recorder
-filenames and explicit user metadata. Their provenance is retained. File copy or
-modification time is not silently promoted to the recording date. A filename does
-not establish a timezone or a course identity.
-
-Known start times and measured duration support continuity suggestions. Gaps,
-overlaps and missing information remain visible for confirmation. The user can
-split groups, merge adjacent recordings, and name a class. The library organizes
-reports by date and time; unknown dates have their own section. Existing source
-and transcript artifacts stay in place.
-
-## Storage and privacy
-
-The selected data root contains managed originals, session manifests, derived
-working audio, exports and library metadata. Runtime/model files use
-`~/Library/Application Support/AudioTranscribe`; caches and logs use the matching
-macOS Library directories. The source checkout is separate from permanent data.
-
-No recordings, transcripts, personal settings, local validation records, model
-weights or compiled apps belong in Git. The public tests use generated fixtures.
-See [privacy and contribution guidance](docs/PRIVACY.md). Sharing a Markdown
-report deliberately shares its full transcript; review it before uploading it
-elsewhere.
-
-## Advanced CLI
+## Development and validation
 
 ```sh
-./scripts/audio-transcribe doctor
-./scripts/audio-transcribe report --order-confirmed /path/part2.wav /path/part10.m4a
-./scripts/audio-transcribe report --order-confirmed --retry-failed /path/recording.wav
-./scripts/audio-transcribe transcribe --session SESSION_ID
-./scripts/audio-transcribe --help
-```
-
-`Transcribe.command` opens the installed app, with the existing CLI/native-dialog
-fallback retained. Optional speaker, capture and glossary profiles are documented
-in [templates/README.md](templates/README.md). Profiles are manual and do not
-identify speakers automatically. Store personal profiles in the data root.
-
-Every attempt preserves raw decoder output, source identity, processing settings
-and validation. Cached results require matching audio, processing and decoder
-identities. **Cancel** stops the owned processing child and retains earlier work.
-There is no arbitrary maximum recording duration; whole-array preprocessing and
-RIFF working-file size remain practical limits. No VAD-based speech removal is
-enabled by default.
-
-## Development
-
-The test suite needs the private media decoder provisioned by `build-app.py`, but
-not Whisper model weights. With the isolated environment above:
-
-```sh
-.venv/bin/python scripts/build-app.py
 .venv/bin/python -m pytest -q
 sh scripts/test-native.sh
+bash scripts/test-layout.sh
+.venv/bin/python scripts/build-app.py
 ```
 
-CI builds the native shell and runs synthetic regression checks on macOS. Mocked
-ASR and logic tests do not establish live inference or listening-based accuracy.
-Use small, non-private fixtures when contributing; never upload real recordings
-or machine diagnostics to explain a bug.
+The build produces `native/build/AudioTranscribe.app`, verifies its ad-hoc signature, and writes an ignored `runtime-manifest.json` recording source/runtime linkage. Building does not install or replace an app. `--settings-path` and `--install-dir` support isolated validation. Layout tests instantiate production AppKit views with synthetic data and private preferences, without starting transcription or monitoring production folders; watcher restoration uses an empty test-owned temporary folder.
 
-## License
-
-Original project code is MIT licensed. Separately obtained dependencies and model
-files retain their upstream licenses; see [third-party notices](THIRD_PARTY_NOTICES.md).
+The engine's cache compatibility version is separate from the application version in `audio_transcribe/product.py`. Scheduling settings do not change ASR cache identity. Automated checks and repetition flags do not establish word accuracy; review uncertain passages against the original audio. Legacy combined-report CLI commands remain available but are not the normal GUI workflow.

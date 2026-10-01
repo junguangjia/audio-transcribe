@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import tempfile
 import uuid
 import unicodedata
@@ -152,6 +153,8 @@ def managed_source_path(session_path: Path | str, source: dict) -> Path:
     """Validate a source identity and return its contained, resolved file path."""
     if not isinstance(source, dict):
         raise ValueError("Each managed source must be a mapping.")
+    if source.get("ownership", "managed") != "managed":
+        raise ValueError("An external reference is not an app-owned source.")
     validate_id(source.get("id"), "source ID")
     relative_value = source.get("path")
     basename = source.get("original_basename")
@@ -176,6 +179,67 @@ def managed_source_path(session_path: Path | str, source: dict) -> Path:
     return resolved
 
 
+def source_stat(path: Path | str) -> dict:
+    """Cheap change token, never proof that two files contain equal bytes."""
+    path = Path(path)
+    value = path.lstat()
+    if not stat.S_ISREG(value.st_mode):
+        raise ValueError("Source must be a regular file, not a symlink or directory.")
+    # Darwin sys/stat.h: SF_DATALESS means a File Provider placeholder has no
+    # local data. Check before a caller can open/hash the source, including if
+    # iCloud evicted it after the native watcher observed its metadata.
+    if getattr(value, "st_flags", 0) & 0x40000000:
+        raise ValueError("iCloud file is not downloaded; keep a local copy in Finder before processing.")
+    return {"device": value.st_dev, "inode": value.st_ino,
+            "size_bytes": value.st_size, "mtime_ns": value.st_mtime_ns,
+            "ctime_ns": value.st_ctime_ns}
+
+
+def _validate_referenced_source(source: dict) -> Path:
+    validate_id(source.get("id"), "source ID")
+    basename = source.get("original_basename")
+    raw = source.get("external_path")
+    identity = source.get("external_identity")
+    if (not isinstance(basename, str) or basename in ("", ".", "..")
+            or Path(basename).name != basename or not isinstance(raw, str)
+            or not Path(raw).is_absolute() or not isinstance(identity, dict)):
+        raise ValueError("External reference requires an absolute source path and identity.")
+    if "path" in source:
+        raise ValueError("External references must not use the managed source path field.")
+    required = {"device", "inode", "size_bytes", "mtime_ns"}
+    if (set(identity) not in (required, required | {"ctime_ns"})
+            or any(type(identity.get(key)) is not int or identity[key] < 0 for key in identity)):
+        raise ValueError("External reference identity is incomplete.")
+    if source.get("size_bytes") != identity["size_bytes"]:
+        raise ValueError("External source size and identity disagree.")
+    digest = source.get("sha256")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("External source requires a lowercase SHA-256.")
+    if type(source.get("order")) is not int or source["order"] < 0:
+        raise ValueError("External source order must be a nonnegative integer.")
+    return Path(raw)
+
+
+def resolve_source_path(session_path: Path | str, source: dict, *, verify_hash=False) -> Path:
+    """Resolve either ownership kind without ever making external bytes deletable."""
+    if source.get("ownership", "managed") == "managed":
+        path = managed_source_path(session_path, source)
+    elif source.get("ownership") == "external_referenced":
+        path = _validate_referenced_source(source)
+        observed = source_stat(path)
+        identity = source["external_identity"]
+        if any(observed[key] != value for key, value in identity.items()):
+            raise ValueError("Referenced original moved or changed; locate the exact version.")
+    else:
+        raise ValueError("Unknown source ownership kind.")
+    # Older references have no ctime token. Their otherwise-matching metadata
+    # is not enough to use the source without rechecking the saved bytes.
+    if (verify_hash or (source.get("ownership") == "external_referenced"
+                        and "ctime_ns" not in source["external_identity"])) and sha256_file(path) != source["sha256"]:
+        raise ValueError("Source bytes changed; cached provenance cannot be used.")
+    return path
+
+
 def validate_session(session_path: Path | str, session=None, *, verify_sources=False) -> dict:
     """Reject malformed identities and path escapes before opening managed data."""
     path = Path(session_path)
@@ -191,7 +255,10 @@ def validate_session(session_path: Path | str, session=None, *, verify_sources=F
         raise ValueError("Session requires a nonempty sources list and explicit source_order.")
     ids = []
     for index, source in enumerate(sources):
-        managed_source_path(path, source)
+        if source.get("ownership", "managed") == "external_referenced":
+            _validate_referenced_source(source)
+        else:
+            managed_source_path(path, source)
         if source["order"] != index:
             raise ValueError("Source order numbers must match the ordered sources list.")
         ids.append(source["id"])
@@ -204,12 +271,15 @@ def validate_session(session_path: Path | str, session=None, *, verify_sources=F
 
 def _verify_managed_sources(path: Path, session: dict):
     for source in session["sources"]:
-        resolved = managed_source_path(path, source)
+        resolved = resolve_source_path(path, source)
         if not resolved.is_file() or resolved.stat().st_size != source["size_bytes"] or sha256_file(resolved) != source["sha256"]:
             raise ValueError("An existing managed source failed integrity verification; preserve it and investigate before reuse.")
 
 
-def import_sources(data_root: Path | str, paths, separate: bool = False, order_confirmed: bool = False):
+def import_sources(data_root: Path | str, paths, separate: bool = False, order_confirmed: bool = False,
+                   *, ownership: str = "managed", verified_hashes=None, verified_stats=None):
+    if ownership not in {"managed", "external_referenced"}:
+        raise ValueError("Choose managed or external referenced input.")
     inputs = [Path(path).expanduser() for path in paths]
     if not inputs:
         raise ValueError("Select at least one existing audio file.")
@@ -218,10 +288,23 @@ def import_sources(data_root: Path | str, paths, separate: bool = False, order_c
     for path in inputs:
         if not path.is_file():
             raise FileNotFoundError(f"Input is missing or is not a regular file: {path}")
-    hashes = [sha256_file(path) for path in inputs]
+    if verified_hashes is not None and (len(verified_hashes) != len(inputs)
+                                       or any(not isinstance(h, str) or not re.fullmatch(r"[0-9a-f]{64}", h)
+                                              for h in verified_hashes)):
+        raise ValueError("Verified source hashes are invalid.")
+    if verified_stats is not None and len(verified_stats) != len(inputs):
+        raise ValueError("Verified source stats are invalid.")
+    observations = [source_stat(path) for path in inputs]
+    if verified_stats is not None and observations != list(verified_stats):
+        raise ValueError("Source changed since its verified hash was measured.")
+    hashes = list(verified_hashes) if verified_hashes is not None else [sha256_file(path) for path in inputs]
+    if [source_stat(path) for path in inputs] != observations:
+        raise ValueError("Source changed during registration; retry after copying finishes.")
     if len(set(hashes)) != len(hashes):
         raise ValueError("The same audio bytes were selected more than once; remove the duplicate selection.")
     data_root = Path(data_root).expanduser()
+    if ownership == "external_referenced" and any(path.resolve().is_relative_to(data_root.resolve()) for path in inputs):
+        raise ValueError("A referenced original cannot be inside application-managed data.")
     data_root.mkdir(parents=True, exist_ok=True)
     sessions_root = data_root / "sessions"
     sessions_root.mkdir(exist_ok=True)
@@ -232,10 +315,22 @@ def import_sources(data_root: Path | str, paths, separate: bool = False, order_c
                 if metadata.parent.name.startswith("."):
                     continue
                 session = validate_session(metadata.parent)
+                if any(source.get("ownership", "managed") != ownership for source in session.get("sources", [])):
+                    continue
                 sources = session.get("sources", [])
                 order = session.get("source_order", [source["id"] for source in sources])
                 by_id = {source["id"]: source for source in sources}
                 existing = [by_id[source_id]["sha256"] for source_id in order]
+                if ownership == "external_referenced" and (len(order) != len(inputs) or any(
+                    by_id[source_id].get("external_path") != str(inputs[index].resolve())
+                    or any(observations[index].get(key) != value for key, value in
+                           by_id[source_id].get("external_identity", {}).items())
+                    for index, source_id in enumerate(order)
+                )):
+                    # Equal bytes at another location are not one owned
+                    # referenced file. Each path keeps its own playback and
+                    # deletion identity, even if inference can later reuse.
+                    continue
                 if hashes == existing:
                     with session_lock(metadata.parent):
                         _verify_managed_sources(metadata.parent, session)
@@ -248,13 +343,26 @@ def import_sources(data_root: Path | str, paths, separate: bool = False, order_c
         final_path = sessions_root / session_id
         staging = Path(tempfile.mkdtemp(prefix=".import-", dir=sessions_root))
         try:
-            (staging / "source").mkdir()
+            if ownership == "managed":
+                (staging / "source").mkdir()
             sources = []
             used_basenames = set()
             date_hints = []
             for index, (input_path, expected_hash) in enumerate(zip(inputs, hashes)):
                 source_id = "src-" + uuid.uuid4().hex
                 basename = input_path.name
+                if ownership == "external_referenced":
+                    before = source_stat(input_path)
+                    if before != observations[index]:
+                        raise ValueError("Source changed before reference registration.")
+                    sources.append({"id": source_id, "original_basename": basename,
+                                    "size_bytes": before["size_bytes"], "sha256": expected_hash,
+                                    "ownership": ownership, "external_path": str(input_path.resolve()),
+                                    "external_identity": before, "order": index})
+                    date_hints.append({"source_id": source_id, "kind": "filesystem_mtime",
+                                       "value": dt.datetime.fromtimestamp(input_path.stat().st_mtime, tz=dt.timezone.utc).isoformat(),
+                                       "provenance": "External file filesystem modification time; not a confirmed recording date or recording timezone."})
+                    continue
                 relative = Path("source") / basename
                 # Casefold also handles the usual case-insensitive macOS volume.
                 normalized_basename = unicodedata.normalize("NFC", basename).casefold()
@@ -275,6 +383,8 @@ def import_sources(data_root: Path | str, paths, separate: bool = False, order_c
                 date_hints.append({"source_id": source_id, "kind": "filesystem_mtime", "value": dt.datetime.fromtimestamp(before.st_mtime, tz=dt.timezone.utc).isoformat(), "provenance": "External file filesystem modification time; not a confirmed recording date or recording timezone."})
             session = {"schema_version": SCHEMA_VERSION, "id": session_id, "recorded_at": None, "date_hints": date_hints, "context": {"course": None, "institution": None, "semester": None, "event": None}, "tags": [], "language": "en", "profiles": {"speaker": None, "capture": None, "glossary": None}, "sources": sources, "source_order": [source["id"] for source in sources], "processing_status": "imported", "runs": []}
             write_yaml(staging / "session.yaml", session)
+            if ownership == "external_referenced" and [source_stat(path) for path in inputs] != observations:
+                raise ValueError("Referenced source changed before session publication.")
             os.rename(staging, final_path)
             _sync_directory(sessions_root)
             return final_path, session, False

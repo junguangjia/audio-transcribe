@@ -1,9 +1,9 @@
-"""One local whisper.cpp process at a time; immutable successful run artifacts."""
+"""Prepared local ASR under batch-owned capacity; immutable run artifacts."""
 from __future__ import annotations
 
 import contextlib
 import copy
-import fcntl
+from dataclasses import dataclass
 import hashlib
 import json
 import math
@@ -26,15 +26,58 @@ from .evaluation import review_flags, timestamp
 from .timeline import audit_timeline, require_timeline, TimelineError, TIMELINE_VERSION
 from .quality import assess_quality, QUALITY_VERSION
 from .progress import DecoderProgress
+from .execution import (ExecutionOwner, OperationContext, OperationCancelled,
+                        cancellable_session_lock)
 from .storage import (read_doc, sha256_file, write_json, write_yaml, session_lock,
-                      validate_session, managed_source_path)
+                      validate_session, resolve_source_path)
 
 TRANSFORM_VERSION = "audio-transcribe-v2-1"
+_PREVIOUS_AUDIO_SHA256 = "56c921d93a0a590c0f4f701841f632a117a7c172dc737c7043ec07caf887e8d3"
+_VALIDATED_STREAMING_A_SHA256 = "a2d5ce896df4c2afa495834d615a2df84d7b924f92e93499ca8410f084868e57"
+
+
+class ResourceAllocationError(RuntimeError):
+    """A decoder log identified an actual memory allocation failure."""
+    resource_allocation_failure = True
+
+
+def _allocation_failure_log(path: Path) -> bool:
+    """Inspect bounded local stderr, never transcribed text or a generic exit."""
+    try:
+        with Path(path).open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 65536))
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    for line in tail.splitlines():
+        value = line.lower()
+        if "mtlcommandbuffererroroutofmemory" in value:
+            return True
+        if any(marker in value for marker in ("ggml", "metal", "malloc", "whisper")) and any(
+                message in value for message in ("out of memory", "failed to allocate", "cannot allocate memory", "allocation failed")):
+            return True
+    return False
 
 
 def transform_identity() -> dict:
     return {"version": TRANSFORM_VERSION, "implementation_sha256": sha256_file(Path(__file__).with_name("audio.py")),
             "dependencies": dependency_versions()}
+
+
+def compatible_transform_identity(saved, preprocessing) -> bool:
+    """Accept one verified byte-equivalent Candidate A predecessor.
+
+    This preserves its original provenance and only reuses complete verified
+    output. New derivatives/runs retain the current implementation hash. Any
+    further audio.py change automatically disables this compatibility rule.
+    """
+    current = transform_identity()
+    if saved == current:
+        return True
+    return (preprocessing.get("candidate") == "A"
+            and current["implementation_sha256"] == _VALIDATED_STREAMING_A_SHA256
+            and saved == {**current, "implementation_sha256": _PREVIOUS_AUDIO_SHA256})
 
 
 def assembly_identity() -> dict:
@@ -83,17 +126,9 @@ def model_identity(runtime: dict, model_name: str) -> dict:
 
 @contextlib.contextmanager
 def inference_lock(settings: dict):
-    root = Path(settings["roots"]["app"])
-    root.mkdir(parents=True, exist_ok=True)
-    with (root / "inference.lock").open("a+") as handle:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise ValueError("Another AudioTranscribe inference is running. Wait for it to finish.") from None
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+    """Compatibility gate; nested operations should pass an OperationContext."""
+    with ExecutionOwner(settings) as owner:
+        yield owner
 
 
 def memory_snapshot() -> dict:
@@ -151,7 +186,15 @@ def backend_evidence(log_path: Path) -> dict:
 
 
 def decode(settings: dict, runtime: dict, model: dict, wav_path: Path, output_dir: Path,
-           asr: dict, glossary: dict, *, timeout=None, progress=None, permit_review=False) -> dict:
+           asr: dict, glossary: dict, *, timeout=None, progress=None, permit_review=False,
+           context=None) -> dict:
+    if context is None:
+        with ExecutionOwner(settings, progress=progress) as owner:
+            return decode(settings, runtime, model, wav_path, output_dir, asr, glossary,
+                          timeout=timeout, progress=progress, permit_review=permit_review,
+                          context=OperationContext(owner, progress=progress))
+    context.check_cancelled()
+    progress = progress or context.progress
     output_dir.mkdir(parents=True, exist_ok=True)
     complete = output_dir / "complete.json"
     prefix = output_dir / "native"
@@ -177,6 +220,7 @@ def decode(settings: dict, runtime: dict, model: dict, wav_path: Path, output_di
         if (cached.get("checkpoint_identity") != checkpoint_identity
                 or sha256_file(output_dir / "native.json") != cached["native_sha256"]):
             raise ValueError("Decoder checkpoint provenance/hash failed; use an explicit forced run.")
+        context.cache("decoder_receipt", True)
         return cached
     provisional = output_dir / "provisional.json"
     if permit_review and provisional.exists():
@@ -184,7 +228,9 @@ def decode(settings: dict, runtime: dict, model: dict, wav_path: Path, output_di
         if (cached.get("checkpoint_identity") != checkpoint_identity
                 or sha256_file(output_dir / "native.json") != cached["native_sha256"]):
             raise ValueError("Provisional decoder provenance/hash failed; use an explicit forced run.")
+        context.cache("decoder_receipt", True)
         return cached
+    context.cache("decoder_receipt", False)
     unfinished = [p for p in output_dir.iterdir() if p.is_file()]
     if unfinished:
         previous_attempt = output_dir / "attempts" / new_id("attempt")
@@ -206,86 +252,91 @@ def decode(settings: dict, runtime: dict, model: dict, wav_path: Path, output_di
         frames, rate = wav.getnframes(), wav.getframerate()
         if wav.getnchannels() != 1 or wav.getsampwidth() != 2 or rate != 16000:
             raise ValueError("Decoder input must be mono 16 kHz PCM16 WAV.")
-    before = memory_snapshot()
-    samples = []
-    started = time.monotonic()
     child = None
-    if progress:
-        progress({"stage": "waiting_for_engine"})
-    with inference_lock(settings), (output_dir / "stdout.log").open("wb") as stdout, (output_dir / "stderr.log").open("wb") as stderr:
-        try:
-            child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
-                                     start_new_session=True)
-            next_sample = 0
-            next_progress = 0
-            decoder_progress = DecoderProgress(output_dir / "stderr.log") if progress else None
-            while child.poll() is None:
-                elapsed = time.monotonic() - started
-                if progress and elapsed >= next_progress:
-                    progress({"stage": "transcribing", "percent": decoder_progress.read()})
-                    next_progress = elapsed + 2
-                if timeout is not None and elapsed > timeout:
-                    raise TimeoutError("Inference exceeded the configured deadline; local logs preserved.")
-                if elapsed >= next_sample:
-                    snap = memory_snapshot()
-                    rss = subprocess.run(["/bin/ps", "-o", "rss=", "-p", str(child.pid)], capture_output=True, text=True)
-                    snap["process_rss_kib"] = int(rss.stdout.strip()) if rss.stdout.strip().isdigit() else None
-                    samples.append(snap)
-                    next_sample = elapsed + 15
-                time.sleep(0.2)
-            if child.returncode:
-                raise RuntimeError(f"whisper.cpp exited {child.returncode}; see local decoder logs at {output_dir}.")
-        except BaseException:
-            if child is not None and child.poll() is None:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(child.pid, signal.SIGTERM)
-                try:
-                    child.wait(timeout=8)
-                except subprocess.TimeoutExpired:
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(child.pid, signal.SIGKILL)
-                    child.wait()
-            raise
-    elapsed = time.monotonic() - started
+    with context.inference_slot():
+        started = time.monotonic()
+        reaped = False
+        with context.span("asr_process"), (output_dir / "stdout.log").open("wb") as stdout, (output_dir / "stderr.log").open("wb") as stderr:
+            try:
+                context.check_cancelled()
+                child = context.owner.spawn(command, stdout=stdout, stderr=stderr, output_dir=output_dir)
+                if context.on_decode_started:
+                    context.on_decode_started()
+                next_progress = 0
+                decoder_progress = DecoderProgress(output_dir / "stderr.log") if progress else None
+                while child.poll() is None:
+                    context.check_cancelled()
+                    elapsed = time.monotonic() - started
+                    if progress and elapsed >= next_progress:
+                        progress({"stage": "transcribing", "percent": decoder_progress.read()})
+                        next_progress = elapsed + 2
+                    if timeout is not None and elapsed > timeout:
+                        raise TimeoutError("Inference exceeded the configured deadline; local logs preserved.")
+                    time.sleep(0.2)
+                reaped = True
+                if child.returncode:
+                    if _allocation_failure_log(output_dir / "stderr.log"):
+                        if context.on_allocation_failure:
+                            context.on_allocation_failure()
+                        raise ResourceAllocationError("Decoder could not allocate memory. Completed files are preserved; retry this file explicitly after resources are available.")
+                    raise RuntimeError(f"whisper.cpp exited {child.returncode}; see local decoder logs at {output_dir}.")
+            except BaseException:
+                if child is not None and not reaped:
+                    try:
+                        child.cancel()
+                        reaped = True
+                    except Exception:
+                        pass  # Preserve cancellation/original failure; owner is poisoned.
+                raise
+            finally:
+                if reaped and context.on_decode_finished:
+                    context.on_decode_finished()
+        elapsed = time.monotonic() - started
+    context.check_cancelled()
     if progress:
         progress({"stage": "validating"})
-    native_path = prefix.with_suffix(".json")
-    if not native_path.is_file():
-        raise RuntimeError("Decoder did not create native JSON; inspect local logs.")
-    native = read_doc(native_path)
-    timeline = audit_timeline(native, frames=frames, rate=rate)
-    write_json(output_dir / "timeline-audit.json", timeline)
-    if not timeline["valid"] and not permit_review:
-        raise TimelineError(timeline)
-    # The CLI explicitly reports how many samples it loaded before inference.
-    reported_samples = re.findall(r"processing .*?\((\d+) samples,", (output_dir / "stderr.log").read_text(errors="replace"))
-    if not reported_samples or int(reported_samples[-1]) != frames:
-        raise RuntimeError("Decoder input sample-count evidence is missing or mismatched; inspect local logs.")
-    backend = backend_evidence(output_dir / "stderr.log")
-    if platform.machine() == "arm64" and not backend["metal_observed"]:
-        raise RuntimeError("Metal activation could not be verified from this native arm64 run's logs.")
-    metadata = {"state": "completed" if timeline["valid"] else "review_required",
-                "timestamp_valid": timeline["valid"], "timeline_audit": timeline,
-                "checkpoint_identity": checkpoint_identity, "elapsed_seconds": elapsed,
-                "real_time_factor": elapsed / (frames / rate) if frames else None,
-                "input_frames": frames, "sample_rate": rate, "input_duration_seconds": frames / rate,
-                "native_timestamp_unit": "milliseconds", "native_sha256": sha256_file(native_path),
-                "backend": backend, "memory_before": before, "memory_during": samples,
-                "memory_after": memory_snapshot(), "network_isolation": network_isolation,
-                "ended_at": now(), "returncode": 0, "cli_reported_input_samples": int(reported_samples[-1])}
-    write_json(complete if timeline["valid"] else provisional, metadata)
+    with context.span("quality_check"):
+        native_path = prefix.with_suffix(".json")
+        if not native_path.is_file():
+            raise RuntimeError("Decoder did not create native JSON; inspect local logs.")
+        native = read_doc(native_path)
+        timeline = audit_timeline(native, frames=frames, rate=rate)
+        write_json(output_dir / "timeline-audit.json", timeline)
+        if not timeline["valid"] and not permit_review:
+            raise TimelineError(timeline)
+        # The CLI explicitly reports how many samples it loaded before inference.
+        reported_samples = re.findall(r"processing .*?\((\d+) samples,", (output_dir / "stderr.log").read_text(errors="replace"))
+        if not reported_samples or int(reported_samples[-1]) != frames:
+            raise RuntimeError("Decoder input sample-count evidence is missing or mismatched; inspect local logs.")
+        backend = backend_evidence(output_dir / "stderr.log")
+        if platform.machine() == "arm64" and not backend["metal_observed"]:
+            raise RuntimeError("Metal activation could not be verified from this native arm64 run's logs.")
+        metadata = {"state": "completed" if timeline["valid"] else "review_required",
+                    "timestamp_valid": timeline["valid"], "timeline_audit": timeline,
+                    "checkpoint_identity": checkpoint_identity, "elapsed_seconds": elapsed,
+                    "real_time_factor": elapsed / (frames / rate) if frames else None,
+                    "input_frames": frames, "sample_rate": rate, "input_duration_seconds": frames / rate,
+                    "native_timestamp_unit": "milliseconds", "native_sha256": sha256_file(native_path),
+                    "backend": backend, "resource_sampling": "disabled; opt-in batch telemetry only",
+                    "network_isolation": network_isolation,
+                    "ended_at": now(), "returncode": 0, "cli_reported_input_samples": int(reported_samples[-1])}
+        write_json(complete if timeline["valid"] else provisional, metadata)
+        if context.telemetry is not None:
+            context.telemetry.record_whisper_log(output_dir / "stderr.log", job_id=context.job_id)
     return metadata
 
 
-def derivative(session_path: Path, source: dict, policy: dict, *, settings=None) -> tuple[Path, dict]:
-    source_path = managed_source_path(session_path, source)
+def derivative(session_path: Path, source: dict, policy: dict, *, settings=None, context=None) -> tuple[Path, dict]:
+    if context:
+        context.check_cancelled()
+    source_path = resolve_source_path(session_path, source)
     if sha256_file(source_path) != source["sha256"]:
         raise ValueError("Managed source hash changed; processing stopped without modifying it.")
     from .media import working_source
     if settings is None:
         from .config import load_settings
         settings = load_settings()
-    working, media = working_source(settings, source_path)
+    working, media = working_source(settings, source_path, **({"context": context} if context else {}))
     identity = {"source": source["sha256"], "policy": policy, "transform": transform_identity()}
     if media:
         identity["media_decode"] = media["identity"]
@@ -297,12 +348,23 @@ def derivative(session_path: Path, source: dict, policy: dict, *, settings=None)
     if manifest_path.exists():
         transform = read_doc(manifest_path)
         if wav_path.is_file() and sha256_file(wav_path) == transform["output_sha256"]:
+            if context:
+                context.cache("derived_audio", True)
             return wav_path, transform
         raise ValueError("A saved derivative failed its hash check; preserve it and use a new recipe.")
     if wav_path.exists():
         # Preserve an interrupted artifact and create a new derivative atomically.
         wav_path.rename(target_dir / ("interrupted-" + uuid.uuid4().hex + ".wav"))
-    transform = prepare_audio(working, wav_path, policy=policy)
+    if context:
+        context.cache("derived_audio", False)
+    with context.span("preprocess") if context else contextlib.nullcontext():
+        if context:
+            from .compute import run_audio_operation
+            transform = run_audio_operation(settings, context, "prepare", working, output=wav_path, policy=policy)
+        else:
+            transform = prepare_audio(working, wav_path, policy=policy)
+    if context:
+        context.check_cancelled()
     if media:
         transform["media_decode"] = media
     transform["recipe_id"] = target_dir.name
@@ -453,8 +515,12 @@ def reuse_verified_decoder_logs(candidates, source_id, output_dir):
         source_dir = candidate / "logs" / source_id
         if not any((source_dir / name).is_file() for name in ("complete.json", "provisional.json")):
             continue
-        # Candidates have matching inference/preprocessing identities and all
-        # output hashes were verified under the session lock before selection.
+        # Completed runs have full artifact hashes; interrupted runs can have
+        # individually completed immutable receipts. Decode rechecks the exact
+        # checkpoint identity before accepting either kind of copied receipt.
+        receipts = [source_dir / name for name in ("complete.json", "provisional.json") if (source_dir / name).is_file()]
+        if any(read_doc(receipt).get("native_sha256") != sha256_file(source_dir / "native.json") for receipt in receipts):
+            raise ValueError("Saved decoder receipt/native hash changed; preserve it and use --force.")
         output_dir.parent.mkdir(parents=True, exist_ok=True)
         staging = output_dir.parent / (".cache-copy-" + uuid.uuid4().hex)
         staging.mkdir()
@@ -499,21 +565,160 @@ def finalize_pointers(session_path: Path, session: dict):
     write_json(current_path, current, overwrite=current_path.exists())
 
 
-def run_session(settings: dict, session_path: Path, resolved: dict, *, force=False, progress=None) -> dict:
-    if progress:
-        progress({"stage": "preparing"})
-    runtime = load_runtime(settings)
-    model = model_identity(runtime, resolved["asr"]["model"])
-    with session_lock(session_path):
+@dataclass(frozen=True)
+class PreparedSession:
+    """Disk-backed preparation only; never retains audio arrays or model tensors."""
+    session_path: Path
+    resolved_digest: str
+    source_identity: str
+    sources: tuple
+    derivatives: tuple
+    runtime: dict
+    model: dict
+    cached_result: dict | None = None
+
+
+def inference_config(resolved):
+    result = copy.deepcopy(resolved)
+    result.pop("execution", None)
+    if "origins" in result:
+        result["origins"] = {k: v for k, v in result["origins"].items() if not k.startswith("execution.")}
+    return result
+
+
+def _source_identity(session, sources):
+    return digest({"session_id": session["id"], "source_order": session["source_order"], "sources": sources})
+
+
+def _checked_sources(session_path, session, context):
+    source_by_id = {source["id"]: source for source in session["sources"]}
+    sources = [source_by_id[sid] for sid in session["source_order"]]
+    for source in sources:
+        context.check_cancelled()
+        if sha256_file(resolve_source_path(session_path, source)) != source["sha256"]:
+            raise ValueError("Source hash changed; processing stopped without modifying it.")
+    return sources
+
+
+def _cached_before_preparation(session_path, session, sources, resolved, runtime, model):
+    # Encoded media depends on the current local decoder as well as original
+    # bytes. Prepare its verified working PCM first; its derivative hash then
+    # participates in the normal cache identity below. WAV needs no media step.
+    if any(Path(source["original_basename"]).suffix.lower() not in {".wav", ".wave"} for source in sources):
+        return None
+    expected = {"application_version": __version__, "sources": [s["sha256"] for s in sources],
+                "model": model, "runtime": runtime["runtime"], "transform_version": TRANSFORM_VERSION,
+                "transform_identity": transform_identity(), "source_order": session["source_order"]}
+    for path in sorted((session_path / "transcript").glob("*/manifest.json"), reverse=True):
+        old = read_doc(path)
+        if (old.get("state") not in {"completed", "review_required"}
+                or any((not compatible_transform_identity(old.get(key), resolved["preprocessing"])
+                        if key == "transform_identity" else old.get(key) != value)
+                       for key, value in expected.items())
+                or inference_config(old.get("resolved_config", {})) != resolved):
+            continue
+        verifier = verify_completed_run if old["state"] == "completed" else verify_review_run
+        if not verifier(path.parent):
+            raise ValueError("Completed output changed; preserve it and use --force for a new run.")
+        if not validate_run_quality(path.parent):
+            continue
+        return {"session_id": session["id"], "run_id": old["run_id"], "path": str(path.parent),
+                "reused": True, "reused_asr": True, "state": old["state"], "quality": old["quality"],
+                "timestamp_valid": old["quality"]["timestamp_valid"]}
+    return None
+
+
+def prepare_session(settings, session_path, resolved, *, runtime=None, model=None, context=None, force=False):
+    """Prepare one session under a short write lock, then release it for decode.
+
+    Callers holding batch ownership may overlap this CPU work with another
+    session's ASR. A direct caller is supported and owns the global gate only
+    during this call; run_session revalidates the returned disk identities.
+    """
+    if context is None:
+        with ExecutionOwner(settings) as owner:
+            return prepare_session(settings, session_path, resolved, runtime=runtime, model=model,
+                                   context=OperationContext(owner), force=force)
+    context.check_cancelled()
+    session_path = Path(session_path).resolve()
+    resolved = inference_config(resolved)
+    runtime = runtime if runtime is not None else load_runtime(settings)
+    model = model if model is not None else model_identity(runtime, resolved["asr"]["model"])
+    with cancellable_session_lock(session_path, context):
         session = validate_session(session_path)
-        source_by_id = {s["id"]: s for s in session["sources"]}
-        sources = [source_by_id[sid] for sid in session["source_order"]]
-        derivatives = [derivative(session_path, source, resolved["preprocessing"], settings=settings) for source in sources]
+        with context.span("file_check"):
+            sources = _checked_sources(session_path, session, context)
+        cached = None if force else _cached_before_preparation(session_path, session, sources, resolved, runtime, model)
+        context.cache("transcript", cached is not None)
+        if cached is not None:
+            if cached["state"] == "completed":
+                finalize_pointers(session_path, session)
+            context.mark("source_artifact_ready")
+            return PreparedSession(session_path, digest(resolved), _source_identity(session, sources),
+                                   tuple(copy.deepcopy(sources)), (), copy.deepcopy(runtime), copy.deepcopy(model), cached)
+        context.emit({"stage": "preparing"})
+        derivatives = []
+        for source in sources:
+            context.check_cancelled()
+            derivatives.append(derivative(session_path, source, resolved["preprocessing"], settings=settings, context=context))
+        context.check_cancelled()
+        return PreparedSession(session_path, digest(resolved), _source_identity(session, sources),
+                               tuple(copy.deepcopy(sources)), tuple(derivatives), copy.deepcopy(runtime), copy.deepcopy(model))
+
+
+def run_session(settings: dict, session_path: Path, resolved: dict, *, force=False, progress=None,
+                prepared=None, runtime=None, model=None, context=None) -> dict:
+    if context is None:
+        with ExecutionOwner(settings, progress=progress) as owner:
+            return run_session(settings, session_path, resolved, force=force, progress=progress,
+                               prepared=prepared, runtime=runtime, model=model,
+                               context=OperationContext(owner, progress=progress))
+    context.check_cancelled()
+    progress = progress or context.progress
+    session_path = Path(session_path).resolve()
+    resolved = inference_config(resolved)
+    if prepared is not None and force and prepared.cached_result is not None:
+        prepared = None
+    prepared = prepared or prepare_session(settings, session_path, resolved, runtime=runtime, model=model,
+                                           context=context, force=force)
+    if prepared.session_path != session_path or prepared.resolved_digest != digest(resolved):
+        raise ValueError("Prepared session/configuration identity changed; prepare again without modifying prior artifacts.")
+    runtime = runtime if runtime is not None else prepared.runtime
+    model = model if model is not None else prepared.model
+    if runtime != prepared.runtime or model != prepared.model:
+        raise ValueError("Prepared runtime/model identity changed; prepare again.")
+    with cancellable_session_lock(session_path, context):
+        session = validate_session(session_path)
+        with context.span("file_check"):
+            sources = _checked_sources(session_path, session, context)
+            if _source_identity(session, sources) != prepared.source_identity:
+                raise ValueError("Prepared source order or identity changed; prepare again.")
+        if prepared.cached_result is not None and not force:
+            cached = _cached_before_preparation(session_path, session, sources, resolved, runtime, model)
+            if cached is None:
+                raise ValueError("Prepared cached transcript changed; preserve artifacts and prepare again.")
+            if cached["state"] == "completed":
+                finalize_pointers(session_path, session)
+            context.mark("source_artifact_ready")
+            return cached
+        derivatives = prepared.derivatives
+        if len(derivatives) != len(sources):
+            raise ValueError("Prepared session does not cover every source.")
+        for wav_path, transform in derivatives:
+            context.check_cancelled()
+            if sha256_file(wav_path) != transform["output_sha256"]:
+                raise ValueError("Prepared derivative hash changed; processing stopped.")
         identity = {"schema_version": 1, "application_version": __version__, "sources": [s["sha256"] for s in sources],
                     "derivatives": [t["output_sha256"] for _, t in derivatives],
                     "resolved_config": resolved, "model": model,
                     "runtime": runtime["runtime"], "transform_version": TRANSFORM_VERSION,
                     "transform_identity": transform_identity(), "assembly_identity": assembly_identity()}
+        media_identities = [transform.get("media_decode", {}).get("identity") for _, transform in derivatives]
+        if any(value is not None for value in media_identities):
+            # Decoder configuration belongs to provenance even when two decoder
+            # versions happen to produce identical PCM bytes. WAV identities
+            # stay unchanged, including all historical standard recordings.
+            identity["media_decode_identities"] = media_identities
         fingerprint = digest(identity)
         transcript_root = session_path / "transcript"
         transcript_root.mkdir(exist_ok=True)
@@ -526,7 +731,19 @@ def run_session(settings: dict, session_path: Path, resolved: dict, *, force=Fal
                 # already verified audio. Reuse only if every inference and
                 # preprocessing identity matches and raw/presentation data pass
                 # the current exact timeline rules. Old files remain unchanged.
-                same_input = all(old.get(k) == v for k, v in identity.items() if k != "assembly_identity")
+                compared = dict(old)
+                if "media_decode_identities" in identity and "media_decode_identities" not in compared:
+                    # Older completed runs recorded this provenance in their
+                    # diagnostics. Read it without mutating the old manifest;
+                    # the full artifact hash check below still gates reuse.
+                    diagnostics_path = previous.parent / "diagnostics.json"
+                    if diagnostics_path.is_file():
+                        historical = {item["source_id"]: item["transform"].get("media_decode", {}).get("identity")
+                                      for item in read_doc(diagnostics_path).get("sources", [])}
+                        compared["media_decode_identities"] = [historical.get(source["id"]) for source in sources]
+                same_input = all((compatible_transform_identity(compared.get(k), resolved["preprocessing"])
+                                  if k == "transform_identity" else compared.get(k) == v)
+                                 for k, v in identity.items() if k != "assembly_identity")
                 if same_input and old.get("state") in {"completed", "review_required"} and old.get("fingerprint") != fingerprint:
                     verifier = verify_completed_run if old["state"] == "completed" else verify_review_run
                     if not verifier(previous.parent):
@@ -537,6 +754,11 @@ def run_session(settings: dict, session_path: Path, resolved: dict, *, force=Fal
                         return {"session_id": session["id"], "run_id": old["run_id"],
                                 "path": str(previous.parent), "reused": True, "state": old["state"],
                                 "quality": old["quality"], "timestamp_valid": old["quality"]["timestamp_valid"]}
+                    cached_paths.append(previous.parent)
+                if (same_input and old.get("state") in {"running", "failed", "interrupted"}
+                        and old.get("fingerprint") != fingerprint):
+                    if read_doc(previous.parent / "resolved-config.yaml") != resolved:
+                        raise ValueError("Interrupted run's configuration snapshot changed; preserve it and use --force.")
                     cached_paths.append(previous.parent)
                 if old.get("fingerprint") == fingerprint:
                     if old.get("state") in {"completed", "review_required"}:
@@ -568,6 +790,18 @@ def run_session(settings: dict, session_path: Path, resolved: dict, *, force=Fal
                         "dependencies": dependency_versions(), "coverage": [],
                         "reference_status": "not_provided", "WER": None}
         manifest["state"] = "running"
+        # Scheduling provenance is outside inference identity. Keep every
+        # consumer of shared work, including retries of an interrupted run.
+        producer_jobs = list(manifest.get("execution", {}).get("producer_jobs", []))
+        current_jobs = getattr(context, "consumer_jobs", None) or ([{"job_id": context.job_id,
+                        "attempt_id": context.attempt_id}] if context.job_id else [])
+        for job_identity in current_jobs:
+            if job_identity not in producer_jobs:
+                producer_jobs.append(job_identity)
+        manifest["execution"] = {"asr_workers": context.owner.asr_workers,
+                                 "producer_jobs": producer_jobs,
+                                 "policy": copy.deepcopy(getattr(context.telemetry, "execution", {})),
+                                 "ownership": "batch-global-lock-with-owned-child-guardian"}
         write_json(manifest_path, manifest, overwrite=manifest_path.exists())
         session["processing_status"] = "running"
         session["profiles"] = resolved["selected_profiles"]
@@ -581,101 +815,108 @@ def run_session(settings: dict, session_path: Path, resolved: dict, *, force=Fal
             reused_decoders = 0
             global_offset = 0.0
             for source, (wav_path, transform) in zip(sources, derivatives):
+                context.check_cancelled()
                 output_dir = run_path / "logs" / source["id"]
                 reused_decoders += reuse_verified_decoder_logs(cached_paths, source["id"], output_dir)
                 meta = decode(settings, runtime, model, wav_path, output_dir, resolved["asr"], resolved["glossary"],
-                              permit_review=True,
+                              permit_review=True, context=context,
                               **({"progress": progress} if progress else {}))
-                duration = meta["input_duration_seconds"]
-                original = transform["source"]
-                expected_frames = (original["complete_frames"] * 16000 + original["sample_rate"] - 1) // original["sample_rate"]
-                if (transform["input_frame_start"] != 0
-                        or transform["input_frame_end"] != original["complete_frames"]
-                        or meta["input_frames"] != transform["output_frames"]
-                        or meta["input_frames"] != expected_frames
-                        or duration != expected_frames / 16000):
-                    raise RuntimeError("Complete-frame coverage/duration assertion failed; current was not updated.")
-                native = read_doc(output_dir / "native.json")
-                segments = decoder_segments(native, source["id"], duration, global_offset=global_offset,
-                                            frames=original["complete_frames"], rate=original["sample_rate"], permit_review=True)
-                timeline = audit_timeline(native, frames=original["complete_frames"], rate=original["sample_rate"])
-                all_segments.extend(segments)
-                coverage = {"source_id": source["id"], "source_sha256": source["sha256"],
-                            "source_path": source["path"], "derived_path": str(wav_path.relative_to(session_path)),
-                            "global_offset_seconds": global_offset, "duration_seconds": duration,
-                            "input_frame_start": transform["input_frame_start"],
-                            "input_frame_end": transform["input_frame_end"],
-                            "source_complete_frames": original["complete_frames"],
-                            "source_sample_rate": original["sample_rate"],
-                            "source_duration_seconds": original["duration_seconds"],
-                            "source_duration_basis": "complete source frames / source sample rate",
-                            "timeline_validation_version": TIMELINE_VERSION,
-                            "timestamp_valid": timeline["valid"], "timeline_audit": timeline,
-                            "duration_tolerance_seconds": 1 / 16000,
-                            "submitted_pcm_frames": meta["input_frames"],
-                            "decoded_input_complete": True, "process_exit_code": 0,
-                            "last_segment_end_seconds": segments[-1]["end_seconds"] if segments else None,
-                            "coverage_evidence": "All derivative frames submitted in a whole-file invocation without offset/duration/VAD; decoder returned success. Segment end is not a coverage boundary.",
-                            "tail": tail_metrics(wav_path, segments[-1]["end_seconds"] if segments else 0)}
-                source_map.append(coverage)
-                diagnostics.append({"source_id": source["id"], "transform": transform, "decoder": meta})
-                global_offset += duration
-            # If interruption occurred while final artifacts were written, preserve them.
-            for name in ("transcript.txt", "transcript.md", "transcript.srt", "transcript.json", "diagnostics.json", "review.md"):
-                existing = run_path / name
-                if existing.exists():
-                    recovery = run_path / "logs" / ("interrupted-finalization-" + uuid.uuid4().hex)
-                    recovery.mkdir(parents=True)
-                    existing.rename(recovery / name)
-            write_transcripts(run_path, all_segments, source_map)
-            quality = assess_quality(all_segments, [{"source_id": item["source_id"], "audit": item["timeline_audit"]}
-                                                    for item in source_map],
-                                     asr=resolved["asr"], glossary=resolved["glossary"])
-            flags = review_flags(all_segments)
-            normalizations = [dict(s["timestamp_normalization"], source_id=s["source_id"])
-                              for s in all_segments if s.get("timestamp_normalization")]
-            write_json(run_path / "diagnostics.json", {"sources": diagnostics, "review_flags": flags,
-                                                       "quality": quality,
-                                                       "timestamp_normalizations": normalizations,
-                                                       "source_map": source_map, "segment_count": len(all_segments)})
-            with (run_path / "review.md").open("x", encoding="utf-8") as handle:
-                handle.write("# Listening review\n\nTechnical completion is not accuracy acceptance. Human reference not provided; WER is null.\n\n")
-                handle.write("Raw text is retained, including repetitions. No inferred speaker, accent, course, names or formulas have been added. Decoder scores are heuristics.\n\n")
-                handle.write(f"Automatic quality status: {quality['status']}. Accuracy verified: false.\n\n")
-                for finding in quality["findings"]:
-                    handle.write(f"- {finding['source_id']} {timestamp(finding['start_seconds'])}–{timestamp(finding['end_seconds'])}: {finding['category']}.\n")
-                    if finding.get("message"):
-                        handle.write(f"  {finding['message']}\n")
-                if quality["timestamp_valid"] is False:
-                    handle.write("\nTimestamps are raw unvalidated model predictions. No timing correction or subtitle export was applied. Exact violations are retained in diagnostics.json.\n\n")
-                for item in normalizations:
-                    handle.write(f"Timestamp warning: {item['source_id']} segment {item['segment']} used the first 10 ms decoder tick enclosing source EOF; its presentation end was normalized to exact source EOF. Raw milliseconds and the normalization reason remain in transcript.json. This does not establish word accuracy.\n\n")
-                handle.write("Inspect the central benchmark's side-by-side comparison for model/processing disagreements. Model agreement is not ground truth.\n\n")
-                if flags:
-                    for flag in flags:
-                        handle.write(f"- {flag['source_id']} {timestamp(flag['start_seconds'])}–{timestamp(flag['end_seconds'])}: {', '.join(flag['reasons'])}.\n")
+                with context.span("quality_check"):
+                    duration = meta["input_duration_seconds"]
+                    original = transform["source"]
+                    expected_frames = (original["complete_frames"] * 16000 + original["sample_rate"] - 1) // original["sample_rate"]
+                    if (transform["input_frame_start"] != 0
+                            or transform["input_frame_end"] != original["complete_frames"]
+                            or meta["input_frames"] != transform["output_frames"]
+                            or meta["input_frames"] != expected_frames
+                            or duration != expected_frames / 16000):
+                        raise RuntimeError("Complete-frame coverage/duration assertion failed; current was not updated.")
+                    native = read_doc(output_dir / "native.json")
+                    segments = decoder_segments(native, source["id"], duration, global_offset=global_offset,
+                                                frames=original["complete_frames"], rate=original["sample_rate"], permit_review=True)
+                    timeline = audit_timeline(native, frames=original["complete_frames"], rate=original["sample_rate"])
+                    all_segments.extend(segments)
+                    coverage = {"source_id": source["id"], "source_sha256": source["sha256"],
+                                "source_path": source.get("path") or source.get("external_path"),
+                                "source_ownership": source.get("ownership", "managed"),
+                                "derived_path": str(wav_path.relative_to(session_path)),
+                                "global_offset_seconds": global_offset, "duration_seconds": duration,
+                                "input_frame_start": transform["input_frame_start"],
+                                "input_frame_end": transform["input_frame_end"],
+                                "source_complete_frames": original["complete_frames"],
+                                "source_sample_rate": original["sample_rate"],
+                                "source_duration_seconds": original["duration_seconds"],
+                                "source_duration_basis": "complete source frames / source sample rate",
+                                "timeline_validation_version": TIMELINE_VERSION,
+                                "timestamp_valid": timeline["valid"], "timeline_audit": timeline,
+                                "duration_tolerance_seconds": 1 / 16000,
+                                "submitted_pcm_frames": meta["input_frames"],
+                                "decoded_input_complete": True, "process_exit_code": 0,
+                                "last_segment_end_seconds": segments[-1]["end_seconds"] if segments else None,
+                                "coverage_evidence": "All derivative frames submitted in a whole-file invocation without offset/duration/VAD; decoder returned success. Segment end is not a coverage boundary.",
+                                "tail": tail_metrics(wav_path, segments[-1]["end_seconds"] if segments else 0)}
+                    source_map.append(coverage)
+                    diagnostics.append({"source_id": source["id"], "transform": transform, "decoder": meta})
+                    global_offset += duration
+            with context.span("source_publish"):
+                # If interruption occurred while final artifacts were written, preserve them.
+                for name in ("transcript.txt", "transcript.md", "transcript.srt", "transcript.json", "diagnostics.json", "review.md"):
+                    existing = run_path / name
+                    if existing.exists():
+                        recovery = run_path / "logs" / ("interrupted-finalization-" + uuid.uuid4().hex)
+                        recovery.mkdir(parents=True)
+                        existing.rename(recovery / name)
+                with context.span("quality_check"):
+                    write_transcripts(run_path, all_segments, source_map)
+                    quality = assess_quality(all_segments, [{"source_id": item["source_id"], "audit": item["timeline_audit"]}
+                                                            for item in source_map],
+                                             asr=resolved["asr"], glossary=resolved["glossary"])
+                    flags = review_flags(all_segments)
+                normalizations = [dict(s["timestamp_normalization"], source_id=s["source_id"])
+                                  for s in all_segments if s.get("timestamp_normalization")]
+                write_json(run_path / "diagnostics.json", {"sources": diagnostics, "review_flags": flags,
+                                                           "quality": quality,
+                                                           "timestamp_normalizations": normalizations,
+                                                           "source_map": source_map, "segment_count": len(all_segments)})
+                with (run_path / "review.md").open("x", encoding="utf-8") as handle:
+                    handle.write("# Listening review\n\nTechnical completion is not accuracy acceptance. Human reference not provided; WER is null.\n\n")
+                    handle.write("Raw text is retained, including repetitions. No inferred speaker, accent, course, names or formulas have been added. Decoder scores are heuristics.\n\n")
+                    handle.write(f"Automatic quality status: {quality['status']}. Accuracy verified: false.\n\n")
+                    for finding in quality["findings"]:
+                        handle.write(f"- {finding['source_id']} {timestamp(finding['start_seconds'])}–{timestamp(finding['end_seconds'])}: {finding['category']}.\n")
+                        if finding.get("message"):
+                            handle.write(f"  {finding['message']}\n")
+                    if quality["timestamp_valid"] is False:
+                        handle.write("\nTimestamps are raw unvalidated model predictions. No timing correction or subtitle export was applied. Exact violations are retained in diagnostics.json.\n\n")
+                    for item in normalizations:
+                        handle.write(f"Timestamp warning: {item['source_id']} segment {item['segment']} used the first 10 ms decoder tick enclosing source EOF; its presentation end was normalized to exact source EOF. Raw milliseconds and the normalization reason remain in transcript.json. This does not establish word accuracy.\n\n")
+                    handle.write("Inspect the central benchmark's side-by-side comparison for model/processing disagreements. Model agreement is not ground truth.\n\n")
+                    if flags:
+                        for flag in flags:
+                            handle.write(f"- {flag['source_id']} {timestamp(flag['start_seconds'])}–{timestamp(flag['end_seconds'])}: {', '.join(flag['reasons'])}.\n")
+                    else:
+                        handle.write("No configured repetition/marker heuristic fired. This does not establish correctness; review the audio alongside the full transcript.\n")
+                    handle.write("\nInspect unclear words, technical terms, quantities, negations and conditions by listening. Keep corrections in separate files with run/interval provenance.\n")
+                    for src in source_map:
+                        handle.write(f"\nSource {src['source_id']}: all {src['submitted_pcm_frames']} derivative frames were submitted; last segment end {src['last_segment_end_seconds']}. Trailing-region measurements are in diagnostics.json and do not by themselves prove silence or omission.\n")
+                elapsed = time.monotonic() - started
+                result_state = "review_required" if quality["status"] == "review_required" else "completed"
+                manifest.update({"state": result_state, "completed_at": now(), "coverage": source_map, "quality": quality,
+                                 "wall_seconds_this_attempt": elapsed,
+                                 "inference_elapsed_seconds": sum(d["decoder"]["elapsed_seconds"] for d in diagnostics),
+                                 "real_time_factor": sum(d["decoder"]["elapsed_seconds"] for d in diagnostics) / global_offset if global_offset else None,
+                                 "segment_count": len(all_segments), "output_hashes": output_hashes(run_path)})
+                manifest["reused_decoder_count"] = reused_decoders
+                write_json(manifest_path, manifest, overwrite=True)
+                verifier = verify_completed_run if result_state == "completed" else verify_review_run
+                if not verifier(run_path):
+                    raise RuntimeError("Final artifact integrity validation failed; current pointer was not changed.")
+                if result_state == "completed":
+                    finalize_pointers(session_path, session)
                 else:
-                    handle.write("No configured repetition/marker heuristic fired. This does not establish correctness; review the audio alongside the full transcript.\n")
-                handle.write("\nInspect unclear words, technical terms, quantities, negations and conditions by listening. Keep corrections in separate files with run/interval provenance.\n")
-                for src in source_map:
-                    handle.write(f"\nSource {src['source_id']}: all {src['submitted_pcm_frames']} derivative frames were submitted; last segment end {src['last_segment_end_seconds']}. Trailing-region measurements are in diagnostics.json and do not by themselves prove silence or omission.\n")
-            elapsed = time.monotonic() - started
-            result_state = "review_required" if quality["status"] == "review_required" else "completed"
-            manifest.update({"state": result_state, "completed_at": now(), "coverage": source_map, "quality": quality,
-                             "wall_seconds_this_attempt": elapsed,
-                             "inference_elapsed_seconds": sum(d["decoder"]["elapsed_seconds"] for d in diagnostics),
-                             "real_time_factor": sum(d["decoder"]["elapsed_seconds"] for d in diagnostics) / global_offset if global_offset else None,
-                             "segment_count": len(all_segments), "output_hashes": output_hashes(run_path)})
-            manifest["reused_decoder_count"] = reused_decoders
-            write_json(manifest_path, manifest, overwrite=True)
-            verifier = verify_completed_run if result_state == "completed" else verify_review_run
-            if not verifier(run_path):
-                raise RuntimeError("Final artifact integrity validation failed; current pointer was not changed.")
-            if result_state == "completed":
-                finalize_pointers(session_path, session)
-            else:
-                session["processing_status"] = "review_required"
-                write_yaml(session_path / "session.yaml", session, overwrite=True)
+                    session["processing_status"] = "review_required"
+                    write_yaml(session_path / "session.yaml", session, overwrite=True)
+            context.mark("source_artifact_ready")
             return {"session_id": session["id"], "run_id": run_path.name, "path": str(run_path),
                     "reused": False, "resumed": bool(resume_path), "state": result_state,
                     "quality": quality, "timestamp_valid": quality["timestamp_valid"],

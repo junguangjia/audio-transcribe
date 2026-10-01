@@ -123,7 +123,17 @@ class MediaTests(unittest.TestCase):
         self.assertEqual([s['selected_path'] for s in manifest['ordered_sources']],[str(p) for p in paths])
         self.assertEqual(manifest['ordered_sources'][-1]['duplicate_of'],1)
         self.assertEqual(Path(first['report']).read_text().count('Complete \\<fixture\\> repeated words words.'),5)
-        self.assertEqual([e['index'] for e in events if e.get('state') in ('completed','failed')],list(range(6)))
+        # Shared aliases and independent workers can complete out of order;
+        # every original selection must still have one terminal event.
+        terminal=[e for e in events if e.get('type')=='file' and e.get('state') in ('completed','failed')]
+        self.assertEqual(sorted(e['index'] for e in terminal),list(range(6)))
+        drained=[e for e in events if e.get('type')=='drained']
+        self.assertEqual(sorted(e['index'] for e in drained),list(range(6)))
+        terminal_by_index={e['index']:e for e in terminal}
+        for event in drained:
+            self.assertEqual(event['state'],terminal_by_index[event['index']]['state'])
+            self.assertGreater(event['seq'],terminal_by_index[event['index']]['seq'])
+        self.assertEqual([e['seq'] for e in events], list(range(1, len(events) + 1)))
         with patch.object(engine,'decode',side_effect=AssertionError('Cached ASR must not rerun')):
             second=export.build_report(self.settings,paths,resolved)
         self.assertEqual(second['reused_transcripts'],5)

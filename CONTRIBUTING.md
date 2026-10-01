@@ -1,8 +1,8 @@
 # Contributing
 
 Use Python 3.12 in a project-local `.venv`. On macOS, install the dependencies
-from requirements-dev.txt, build the native shell to provision its private media
-decoder, and run the checks documented in README.md. No model download is needed
+from requirements-dev.txt, explicitly provision the pinned media decoder,
+then build the native shell and run the checks documented in README.md. No model download is needed
 for synthetic tests.
 
 Changes must preserve source audio, explicit recording order, immutable raw

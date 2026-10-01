@@ -11,7 +11,7 @@ import re
 import unicodedata
 
 from .audio import _parse
-from .storage import (_file_lock, locate_session, managed_source_path, read_doc,
+from .storage import (_file_lock, locate_session, resolve_source_path, read_doc,
                       sha256_file, validate_id, validate_session, write_json)
 
 LIBRARY_VERSION = 1
@@ -174,7 +174,7 @@ def _known_recordings(data_root):
                 explicit = source.get("recorded_at")
                 if explicit is None and len(session["sources"]) == 1:
                     explicit = session.get("recorded_at")
-                known[str(managed_source_path(path.parent, source))] = {"recorded_at": explicit}
+                known[str(resolve_source_path(path.parent, source))] = {"recorded_at": explicit}
         except (OSError, ValueError, KeyError):
             continue
     return known
@@ -354,7 +354,7 @@ def read_report(settings, report_id, query="", *, view="active"):
             session_path = locate_session(settings["roots"]["data"], transcript["session_id"])
             session = validate_session(session_path)
             source = next(s for s in session["sources"] if s["id"] == transcript["source_id"])
-            item["audio_path"] = str(managed_source_path(session_path, source))
+            item["audio_path"] = str(resolve_source_path(session_path, source, verify_hash=True))
             run_id = validate_id(transcript["run_id"], "run ID")
             stored = session_path / "transcript" / run_id / "transcript.json"
             if stored.resolve().is_relative_to(session_path.resolve()) and sha256_file(stored) == transcript.get("transcript_json_sha256"):

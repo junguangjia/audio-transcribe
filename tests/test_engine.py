@@ -8,9 +8,26 @@ from unittest.mock import patch
 import wave
 
 from audio_transcribe import benchmark, config, engine, storage
+from audio_transcribe.execution import ExecutionOwner, OperationContext
+from audio_transcribe.thermal import ThermalController
 
 
 class EngineTests(unittest.TestCase):
+    def test_previous_candidate_a_identity_is_narrowly_compatible(self):
+        current = engine.transform_identity()
+        self.assertEqual(current["implementation_sha256"], engine._VALIDATED_STREAMING_A_SHA256)
+        previous = {**current, "implementation_sha256": engine._PREVIOUS_AUDIO_SHA256}
+        self.assertTrue(engine.compatible_transform_identity(previous, {"candidate": "A"}))
+        self.assertFalse(engine.compatible_transform_identity(previous, {"candidate": "B"}))
+        self.assertFalse(engine.compatible_transform_identity({**previous, "dependencies": {}}, {"candidate": "A"}))
+
+    def test_decoder_allocation_log_classifier_is_specific(self):
+        log = self.root / "decoder.log"
+        log.write_text("ggml_metal: failed to allocate buffer\n", encoding="utf-8")
+        self.assertTrue(engine._allocation_failure_log(log))
+        log.write_text("ordinary whisper log\nThe speaker said out of memory.\n", encoding="utf-8")
+        self.assertFalse(engine._allocation_failure_log(log))
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -50,6 +67,83 @@ class EngineTests(unittest.TestCase):
         if not native.exists():
             storage.write_json(native, {"transcription": [{"offsets": {"from": 100, "to": 500}, "text": "Synthetic fixture only."}]})
         return {"input_duration_seconds": frames / rate, "input_frames": frames, "elapsed_seconds": 0.01, "real_time_factor": 0.01 / (frames / rate), "native_sha256": storage.sha256_file(native)}
+
+    def test_prepared_session_keeps_disk_metadata_and_rechecks_sources_and_derivatives(self):
+        path = self.session(multiple=True)
+        prepared = engine.prepare_session(self.settings, path, self.resolved)
+        self.assertEqual(len(prepared.sources), 2)
+        self.assertEqual(len(prepared.derivatives), 2)
+        self.assertTrue(all(isinstance(item[0], Path) for item in prepared.derivatives))
+        with patch.object(engine, "derivative", side_effect=AssertionError("must not prepare twice")), \
+                patch.object(engine, "decode", side_effect=self.mocked_decoder):
+            result = engine.run_session(self.settings, path, self.resolved, prepared=prepared)
+        self.assertEqual(self.inferences, 2)
+        self.assertEqual(result["state"], "completed")
+        altered = prepared.derivatives[0][0]
+        altered.write_bytes(altered.read_bytes() + b"changed")
+        with patch.object(engine, "decode", side_effect=AssertionError("must not decode")), self.assertRaisesRegex(ValueError, "derivative hash"):
+            engine.run_session(self.settings, path, self.resolved, prepared=prepared, force=True)
+        original = storage.managed_source_path(path, prepared.sources[0])
+        original.write_bytes(original.read_bytes() + b"changed")
+        with self.assertRaisesRegex(ValueError, "Managed source"):
+            engine.run_session(self.settings, path, self.resolved, prepared=prepared)
+
+    def test_completed_cache_skips_derivative_and_execution_changes_do_not_invalidate(self):
+        path = self.session()
+        with patch.object(engine, "decode", side_effect=self.mocked_decoder):
+            result = engine.run_session(self.settings, path, self.resolved)
+        changed = copy.deepcopy(self.resolved)
+        changed["execution"] = {"asr_workers": 2, "prepared_ahead": 1}
+        changed["origins"]["execution.asr_workers"] = "request"
+        with patch.object(engine, "derivative", side_effect=AssertionError("must skip preparation")), \
+                patch.object(engine, "decode", side_effect=AssertionError("must not decode")):
+            prepared = engine.prepare_session(self.settings, path, changed)
+            reused = engine.run_session(self.settings, path, changed, prepared=prepared)
+        self.assertEqual(prepared.derivatives, ())
+        self.assertEqual(reused["run_id"], result["run_id"])
+        self.assertEqual(self.inferences, 1)
+        self.assertEqual(storage.read_doc(Path(result["path"]) / "manifest.json")["execution"]["asr_workers"], 1)
+
+    def test_encoded_media_fast_cache_cannot_bypass_changed_decoder_pcm(self):
+        from audio_transcribe import media
+        encoded = self.root / "synthetic.mp3"
+        encoded.write_bytes(b"synthetic encoded bytes; no real decoder needed")
+        path = storage.import_sources(self.data, [encoded])[0]
+        first_pcm = self.source("decoded-first.wav", amplitude=1000)
+        second_pcm = self.source("decoded-second.wav", amplitude=3000)
+        self.resolved["preprocessing"]["gain_db"] = 0.0
+        with patch.object(media, "working_source", return_value=(first_pcm, {"identity": {"decoder": "first"}})), \
+                patch.object(engine, "decode", side_effect=self.mocked_decoder):
+            first = engine.run_session(self.settings, path, self.resolved)
+        original = {p: p.read_bytes() for p in Path(first["path"]).rglob("*") if p.is_file()}
+        with patch.object(media, "working_source", return_value=(second_pcm, {"identity": {"decoder": "changed"}})), \
+                patch.object(engine, "decode", side_effect=self.mocked_decoder):
+            prepared = engine.prepare_session(self.settings, path, self.resolved)
+            self.assertIsNone(prepared.cached_result)
+            second = engine.run_session(self.settings, path, self.resolved, prepared=prepared)
+        self.assertNotEqual(first["run_id"], second["run_id"])
+        self.assertEqual(self.inferences, 2)
+        for artifact, data in original.items():
+            self.assertEqual(artifact.read_bytes(), data)
+        # Even equal PCM must not misreport which media decoder was selected.
+        with patch.object(media, "working_source", return_value=(second_pcm, {"identity": {"decoder": "third-same-pcm"}})), \
+                patch.object(engine, "decode", side_effect=self.mocked_decoder):
+            third = engine.run_session(self.settings, path, self.resolved)
+            reused = engine.run_session(self.settings, path, self.resolved)
+        self.assertNotEqual(second["run_id"], third["run_id"])
+        self.assertEqual(reused["run_id"], third["run_id"])
+        self.assertEqual(self.inferences, 3)
+        self.assertEqual(storage.read_doc(Path(third["path"]) / "manifest.json")["media_decode_identities"],
+                         [{"decoder": "third-same-pcm"}])
+
+    def test_cached_preparation_can_be_explicitly_forced_to_new_decode(self):
+        path = self.session()
+        with patch.object(engine, "decode", side_effect=self.mocked_decoder):
+            first = engine.run_session(self.settings, path, self.resolved)
+            prepared = engine.prepare_session(self.settings, path, self.resolved)
+            second = engine.run_session(self.settings, path, self.resolved, prepared=prepared, force=True)
+        self.assertNotEqual(first["run_id"], second["run_id"])
+        self.assertEqual(self.inferences, 2)
 
     def test_timestamp_units_offsets_and_invalid_schema(self):
         native = {"transcription": [{"offsets": {"from": 1250, "to": 2250}, "text": "Fixture"}]}
@@ -304,8 +398,12 @@ class EngineTests(unittest.TestCase):
         manifest["output_hashes"]=engine.output_hashes(old)
         storage.write_json(old/"manifest.json",manifest,overwrite=True)
         before={p:p.read_bytes() for p in old.rglob("*") if p.is_file()}
-        with patch.object(engine.subprocess,"Popen",side_effect=AssertionError("No new ASR")):
-            result=engine.run_session(self.settings,session,self.resolved)
+        # This fixture forbids every subprocess during receipt reuse. Disable
+        # the independent thermal observer without weakening the ASR guard.
+        with ExecutionOwner(self.settings,thermal=ThermalController(monitor=False)) as owner, \
+                patch.object(engine.subprocess,"Popen",side_effect=AssertionError("No new ASR")) as launch:
+            result=engine.run_session(self.settings,session,self.resolved,context=OperationContext(owner))
+            launch.assert_not_called()
         self.assertTrue(result["reused_asr"])
         self.assertNotEqual(result["run_id"],first["run_id"])
         self.assertEqual(self.inferences,1)
@@ -316,6 +414,33 @@ class EngineTests(unittest.TestCase):
         with patch.object(engine,"decode",side_effect=AssertionError("No repeated reassembly")):
             reused=engine.run_session(self.settings,session,self.resolved)
         self.assertEqual(reused["run_id"],result["run_id"])
+
+    def test_renderer_change_recovers_completed_receipt_from_interrupted_attempt(self):
+        path = self.session()
+        def receipt_decoder(*args, **kwargs):
+            metadata = self.mocked_decoder(*args, **kwargs)
+            settings, runtime, model, wav, output, asr, glossary = args
+            metadata["checkpoint_identity"] = engine.digest({"input_sha256": storage.sha256_file(wav),
+                "model_sha256": model["sha256"], "runtime_sha256": runtime["runtime"]["sha256"],
+                "asr": asr, "glossary": glossary})
+            storage.write_json(output / "complete.json", metadata)
+            return metadata
+        with patch.object(engine, "decode", side_effect=receipt_decoder), \
+                patch.object(engine, "write_transcripts", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            engine.run_session(self.settings, path, self.resolved)
+        original = next(path.glob("transcript/*/manifest.json")).parent
+        saved = {p: p.read_bytes() for p in original.rglob("*") if p.is_file()}
+        with ExecutionOwner(self.settings,thermal=ThermalController(monitor=False)) as owner, \
+                patch.object(engine, "assembly_identity", return_value={"fixture": "new-renderer"}), \
+                patch.object(engine.subprocess, "Popen", side_effect=AssertionError("Must reuse saved inference")) as launch:
+            result = engine.run_session(self.settings, path, self.resolved,context=OperationContext(owner))
+            launch.assert_not_called()
+        self.assertNotEqual(Path(result["path"]), original)
+        self.assertEqual(result["state"], "completed")
+        self.assertTrue(result["reused_asr"])
+        for artifact, content in saved.items():
+            self.assertEqual(artifact.read_bytes(), content)
+        self.assertEqual(self.inferences, 1)
 
     def test_source_path_escape_rejected(self):
         path = self.session()
@@ -358,10 +483,10 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(storage.sha256_file(reference), expected_hash)
         self.assertEqual(storage.sha256_file(Path(verified["path"]) / "reference.txt"), expected_hash)
 
-    def test_active_session_rejected_before_benchmark_mutation(self):
+    def test_active_session_wait_cancels_before_benchmark_mutation(self):
         path = self.session()
         with storage.session_lock(path):
-            with self.assertRaises(RuntimeError):
+            with patch("audio_transcribe.execution.time.sleep", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
                 self.run_fixture_benchmark(path)
         self.assertEqual(list((self.data / "benchmarks").glob("*/evaluations/*/manifest.json")), [])
 

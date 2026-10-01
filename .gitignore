@@ -6,7 +6,9 @@ __pycache__/
 STATUS.md
 native/vendor/
 native/build/
+native/assets/
 native/media-runtime.json
+runtime-manifest.json
 .local/
 .env
 .env.*

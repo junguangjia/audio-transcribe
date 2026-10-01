@@ -22,12 +22,16 @@ EXPECTED_SOURCE_SHA256 = "97efb490c10fc2a066d7cca60bfa17e984e4bcd5b88c811322491c
 
 def run_benchmark(settings: dict, session_path: Path, resolved: dict, *, intervals=None,
                   pilot=False, force=False) -> dict:
-    with session_lock(session_path):
-        return _run_benchmark_locked(settings, session_path, resolved, intervals=intervals, pilot=pilot, force=force)
+    from .execution import ExecutionOwner, OperationContext, cancellable_session_lock
+    with ExecutionOwner(settings) as owner:
+        context = OperationContext(owner)
+        with cancellable_session_lock(session_path, context):
+            return _run_benchmark_locked(settings, session_path, resolved, intervals=intervals,
+                                         pilot=pilot, force=force, context=context)
 
 
 def _run_benchmark_locked(settings: dict, session_path: Path, resolved: dict, *, intervals=None,
-                          pilot=False, force=False) -> dict:
+                          pilot=False, force=False, context=None) -> dict:
     runtime = load_runtime(settings)
     session = validate_session(session_path)
     if intervals is None:
@@ -101,7 +105,7 @@ def _run_benchmark_locked(settings: dict, session_path: Path, resolved: dict, *,
                 asr["model"] = model_name
                 for clip in clips:
                     source = source_by_id[clip["source_id"]]
-                    wav_path, transform = derivative(session_path, source, policy, settings=settings)
+                    wav_path, transform = derivative(session_path, source, policy, settings=settings, context=context)
                     output_dir = evaluation / candidate_name / clip["id"]
                     output_dir.mkdir(parents=True, exist_ok=True)
                     excerpt = output_dir / "excerpt.wav"
@@ -116,7 +120,7 @@ def _run_benchmark_locked(settings: dict, session_path: Path, resolved: dict, *,
                         slicing = slice_pcm16(wav_path, excerpt, clip["start_seconds"], clip["end_seconds"])
                         write_json(excerpt_meta, slicing)
                     metadata = decode(settings, runtime, model_map[model_name], excerpt,
-                                      output_dir / "logs", asr, resolved["glossary"])
+                                      output_dir / "logs", asr, resolved["glossary"], context=context)
                     native = read_doc(output_dir / "logs" / "native.json")
                     segments = decoder_segments(native, clip["source_id"], metadata["input_duration_seconds"],
                                                 source_start=slicing["timestamp_offset_seconds"])
