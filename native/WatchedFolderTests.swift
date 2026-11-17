@@ -54,6 +54,68 @@ import CoreServices
         precondition(WatchedFolderMonitor.snapshot(posix).files[0].version != firstPosix.files[0].version,
                      "metadata versions must detect a changed file without reading its bytes")
 
+        // A metadata refresh must preserve the verified-byte cache; full
+        // verification remains an explicit operation. Use an isolated stream
+        // failure so real filesystem notifications cannot change these hints.
+        var refreshPublications: [([WatchedFileSnapshot], Set<String>)] = []
+        var directoryScans = 0
+        let refreshMonitor = WatchedFolderMonitor(streamFactory: { _, _, _ in nil },
+                                                  pollInterval: 60)
+        refreshMonitor.onScanStarted = { [weak refreshMonitor] in
+            precondition(refreshMonitor?.checkingDirectory == true,
+                         "an admitted directory scan must report that it is running")
+            directoryScans += 1
+        }
+        refreshMonitor.onSnapshot = { files, _, changed in
+            refreshPublications.append((files, changed))
+        }
+        refreshMonitor.start(posix)
+        precondition(until(3) { refreshPublications.last?.0.contains { $0.stable } == true },
+                     "refresh fixture must settle before checking invalidation")
+        let beforeRefresh = refreshPublications.count
+        refreshMonitor.refresh()
+        precondition(until(2) { refreshPublications.count > beforeRefresh })
+        precondition(refreshPublications.last?.1.isEmpty == true,
+                     "ordinary refresh must not mark unchanged audio for full-byte verification")
+        let beforeFullVerification = refreshPublications.count
+        refreshMonitor.refresh(forceVerify: true)
+        precondition(until(2) { refreshPublications.count > beforeFullVerification })
+        precondition(refreshPublications.last?.1 == Set([unicodeFile.path]),
+                     "explicit full verification must invalidate every available audio path")
+        let afterFullVerification = refreshPublications.count
+        refreshMonitor.refresh()
+        precondition(until(2) { refreshPublications.count > afterFullVerification })
+        precondition(refreshPublications.last?.1.isEmpty == true,
+                     "full verification must not leak into the next ordinary refresh")
+
+        let beforeAddition = directoryScans
+        let settlingFile = posix.appendingPathComponent("settling.wav")
+        try Data("first write".utf8).write(to: settlingFile)
+        refreshMonitor.refresh()
+        func lastObservation() -> WatchedFileSnapshot? {
+            refreshPublications.last?.0.first { $0.path == settlingFile.path }
+        }
+        precondition(until(2) { lastObservation()?.stable == false })
+        let firstVersion = lastObservation()?.version
+        try Data("more data after the first observation".utf8).write(to: settlingFile)
+        precondition(until(2) { lastObservation()?.stable == false && lastObservation()?.version != firstVersion },
+                     "a metadata change between stability checks must restart settling")
+        precondition(until(2) { lastObservation()?.stable == true },
+                     "a targeted recheck must stabilize a new file after writing finishes")
+        precondition(directoryScans == beforeAddition + 1,
+                     "settling a new file must not restart full directory reconciliation")
+        precondition(refreshPublications.last?.0.first { $0.path == unicodeFile.path }?.stable == true,
+                     "a targeted recheck must preserve observations of established recordings")
+
+        let movingFile = posix.appendingPathComponent("removed-before-stable.wav")
+        try Data("temporary".utf8).write(to: movingFile)
+        refreshMonitor.refresh()
+        precondition(until(2) { refreshPublications.last?.0.contains { $0.path == movingFile.path && !$0.stable } == true })
+        try FileManager.default.removeItem(at: movingFile)
+        precondition(until(2) { refreshPublications.last?.0.contains { $0.path == movingFile.path } == false },
+                     "a removed candidate must never be published as stable")
+        refreshMonitor.stop()
+
         let firstEntered = DispatchSemaphore(value: 0)
         let releaseFirst = DispatchSemaphore(value: 0)
         var publications: [(String, String, [WatchedFileSnapshot])] = []
@@ -291,9 +353,11 @@ import CoreServices
         postHealthyLock.lock(); blockLaterScans = true; postHealthyLock.unlock()
         postHealthyMonitor.refresh()
         precondition(until(2) { postHealthyEntered.wait(timeout: .now()) == .success })
+        precondition(postHealthyMonitor.checkingDirectory, "a blocked directory scan must report that it is running")
         precondition(until(2) { postHealthyPublications.contains { $0.0.contains("无法读取监控文件夹") &&
             $0.1.contains { $0.path == retainedFile.path } } },
             "a later blocked scan must warn while retaining previously published files")
+        precondition(!postHealthyMonitor.checkingDirectory, "a timed-out scan must yield to its warning")
         postHealthyLock.lock(); blockLaterScans = false; postHealthyLock.unlock()
         releasePostHealthy.signal()
         precondition(until(3) { postHealthyPublications.filter { $0.0 == "已启用" }.count > healthyBeforeBlock },

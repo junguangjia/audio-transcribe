@@ -10,11 +10,12 @@ struct WatchedFileSnapshot: Equatable {
     let unavailableReason: String?
 }
 
-/// A running-app-only FSEvents observer. Events are hints; every notification
-/// reconciles the direct children of the selected directory. File metadata is
-/// gathered away from the main thread, and stability is observed twice before
-/// a candidate is offered to the independent backend verifier.
+/// A running-app-only FSEvents observer. Events trigger directory reconciliation.
+/// Between reconciliations, recheck only candidates still settling. All file
+/// metadata is gathered off the main thread before offering a candidate to the
+/// independent backend verifier.
 final class WatchedFolderMonitor {
+    var onScanStarted: (() -> Void)?
     var onSnapshot: (([WatchedFileSnapshot], String, Set<String>) -> Void)?
     private(set) var folder: URL?
     private var streamSession: StreamSession?
@@ -28,8 +29,10 @@ final class WatchedFolderMonitor {
     private var lastSeen: [String: String] = [:]
     private var lastSeenAt: [String: TimeInterval] = [:]
     private var enumerationRunning = false
+    private var directoryScanRunning = false
     private var refreshPending = false
     private var scanAdmissionDelayed = false
+    private var pendingReconciliation = false
     private var pendingChangedPaths = Set<String>()
     private var pendingForceFull = false
     private var lastPublished: [WatchedFileSnapshot] = []
@@ -37,6 +40,9 @@ final class WatchedFolderMonitor {
     private var scanTimedOut = false
     private var scanAttempt = 0
 
+    var checkingDirectory: Bool { directoryScanRunning && !scanTimedOut }
+
+    private static let stabilityInterval: TimeInterval = 0.8
     private let unreadableFolderStatus = "无法读取监控文件夹；请检查 macOS 桌面访问提示，或重新选择文件夹。"
 
     // Injectable so a test can hold FSEventStreamCreate in flight while the
@@ -244,7 +250,7 @@ final class WatchedFolderMonitor {
         session.begin()
         // An early scan can populate the UI while File Provider connects. A
         // second scan after subscription closes the startup event gap.
-        scheduleRefresh(after: 0)
+        requestReconciliation(after: 0)
         let expected = generation
         DispatchQueue.main.asyncAfter(deadline: .now() + slowThreshold) { [weak self] in
             guard let self, self.generation == expected, self.folder?.path == selected.path,
@@ -264,7 +270,9 @@ final class WatchedFolderMonitor {
         lastSeen.removeAll(); lastSeenAt.removeAll(); pendingChangedPaths.removeAll(); pendingForceFull = false
         lastPublished.removeAll(); lastScanHealthy = false
         scanTimedOut = false; scanAttempt = 0
-        enumerationRunning = false; refreshPending = false; scanAdmissionDelayed = false
+        enumerationRunning = false; directoryScanRunning = false
+        refreshPending = false; scanAdmissionDelayed = false
+        pendingReconciliation = false
     }
 
     private func accepts(_ session: StreamSession) -> Bool {
@@ -277,7 +285,7 @@ final class WatchedFolderMonitor {
         // The post-subscription metadata scan closes the event gap by version
         // comparison; unchanged files do not need backend re-hashing. Keep a
         // fallback poll until that scan confirms the root is actually usable.
-        scheduleRefresh(after: 0)
+        requestReconciliation(after: 0)
     }
 
     private func streamFailed(session: StreamSession, message: String) {
@@ -292,12 +300,12 @@ final class WatchedFolderMonitor {
         guard accepts(session) else { return }
         pendingChangedPaths.formUnion(paths)
         pendingForceFull = pendingForceFull || forceFull
-        scheduleRefresh(after: 0.35)
+        requestReconciliation(after: 0.35)
     }
 
     func refresh(forceVerify: Bool = false) {
         if forceVerify { pendingForceFull = true }
-        scheduleRefresh(after: 0)
+        requestReconciliation(after: 0)
     }
 
     var usingPolling: Bool { pollTimer != nil }
@@ -322,10 +330,21 @@ final class WatchedFolderMonitor {
         return lastScanHealthy ? "已启用（定时检查）" : "文件夹监控连接较慢；等待首次检查。"
     }
 
-    private func scheduleRefresh(after delay: TimeInterval) {
+    private func requestReconciliation(after delay: TimeInterval) {
+        pendingReconciliation = true
+        scheduleCheck(after: delay)
+    }
+
+    private func scheduleCheck(after delay: TimeInterval) {
         guard folder != nil else { return }
+        let deadline = Date(timeIntervalSinceNow: delay)
+        // A later notification must not postpone a scan already due sooner.
+        if let timer, timer.fireDate <= deadline { return }
         timer?.invalidate()
-        let scheduled = Timer(timeInterval: delay, repeats: false) { [weak self] _ in self?.enumerate() }
+        let scheduled = Timer(fire: deadline, interval: 0, repeats: false) { [weak self] _ in
+            self?.timer = nil
+            self?.enumerate()
+        }
         timer = scheduled
         RunLoop.main.add(scheduled, forMode: .common)
     }
@@ -333,6 +352,9 @@ final class WatchedFolderMonitor {
     private func enumerate() {
         guard let folder else { return }
         if enumerationRunning { refreshPending = true; return }
+        let reconcile = pendingReconciliation || !lastScanHealthy
+        let previousFiles = lastPublished
+        guard reconcile || previousFiles.contains(where: { !$0.stable && $0.unavailableReason == nil }) else { return }
         guard SnapshotLimit.acquire() else {
             if !scanAdmissionDelayed {
                 scanAdmissionDelayed = true
@@ -340,11 +362,12 @@ final class WatchedFolderMonitor {
             }
             // Do not enqueue a waiter behind a File Provider call: a single
             // timer represents the latest root and is cancelled on stop/swap.
-            scheduleRefresh(after: 1.0)
+            scheduleCheck(after: 1.0)
             return
         }
         scanAdmissionDelayed = false
         enumerationRunning = true
+        directoryScanRunning = reconcile
         scanAttempt += 1
         let expected = generation
         let expectedAttempt = scanAttempt
@@ -358,14 +381,22 @@ final class WatchedFolderMonitor {
         let forceFull = pendingForceFull
         pendingChangedPaths.removeAll()
         pendingForceFull = false
+        pendingReconciliation = false
+        if reconcile { onScanStarted?() }
         let snapshotFactory = self.snapshotFactory
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let result = snapshotFactory(folder)
+            let result = reconcile ? snapshotFactory(folder) : Self.recheckSettling(previousFiles)
             SnapshotLimit.release()
             DispatchQueue.main.async {
                 guard let self, self.generation == expected, self.folder?.path == folder.path else { return }
                 self.enumerationRunning = false
+                self.directoryScanRunning = false
                 self.scanTimedOut = false
+                guard let result else {
+                    self.refreshPending = false
+                    self.requestReconciliation(after: 0)
+                    return
+                }
                 let now = ProcessInfo.processInfo.systemUptime
                 var output: [WatchedFileSnapshot] = []
                 var nextSeen: [String: String] = [:]
@@ -373,7 +404,7 @@ final class WatchedFolderMonitor {
                 for item in result.files {
                     let previous = self.lastSeen[item.path]
                     let firstSeenAt = previous == item.version ? self.lastSeenAt[item.path] ?? now : now
-                    let stable = previous == item.version && now - firstSeenAt >= 0.8
+                    let stable = previous == item.version && now - firstSeenAt >= Self.stabilityInterval
                     output.append(WatchedFileSnapshot(path: item.path, filename: item.filename,
                                                       version: item.version, stable: stable,
                                                       unavailableReason: item.unavailableReason))
@@ -402,8 +433,13 @@ final class WatchedFolderMonitor {
                     }
                 }
                 self.onSnapshot?(output, state, forceFull ? Set(output.map(\.path)) : changedDirect)
-                if self.refreshPending { self.refreshPending = false; self.scheduleRefresh(after: 0) }
-                else if output.contains(where: { !$0.stable }) { self.scheduleRefresh(after: 1.0) }
+                if self.refreshPending {
+                    self.refreshPending = false
+                    self.scheduleCheck(after: 0)
+                } else if let nextObservation = output.lazy.filter({ !$0.stable && $0.unavailableReason == nil })
+                    .compactMap({ nextSeenAt[$0.path] }).min() {
+                    self.scheduleCheck(after: max(0, nextObservation + Self.stabilityInterval - now))
+                }
             }
         }
     }
@@ -430,25 +466,40 @@ final class WatchedFolderMonitor {
             guard let name, name != ".", name != "..", !name.hasPrefix(".") else { continue }
             let path = folder.path + "/" + name
             guard DirectImport.supportedFile(URL(fileURLWithPath: path)) else { continue }
-            var metadata = stat()
-            guard Darwin.lstat(path, &metadata) == 0 else { continue }
-            guard metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
-                  metadata.st_flags & UInt32(UF_HIDDEN) == 0 else { continue }
-            // SF_DATALESS is the macOS file-provider placeholder flag. Never
-            // open a dataless file or hand it to backend hashing/discovery.
-            let unavailableReason = placeholderReason(flags: metadata.st_flags)
-            // Metadata only: device/inode/size/nanosecond times and dataless
-            // state detect replacement without reading or downloading bytes.
-            let version = String(metadata.st_dev) + ":" + String(metadata.st_ino) + ":" +
-                String(metadata.st_size) + ":" +
-                String(metadata.st_mtimespec.tv_sec) + ":" + String(metadata.st_mtimespec.tv_nsec) + ":" +
-                String(metadata.st_ctimespec.tv_sec) + ":" + String(metadata.st_ctimespec.tv_nsec) + ":" +
-                String(metadata.st_flags)
-            files.append(WatchedFileSnapshot(path: path, filename: name, version: version, stable: false,
-                                             unavailableReason: unavailableReason))
+            if let file = metadataSnapshot(path: path, filename: name) { files.append(file) }
         }
         files.sort { $0.filename.localizedStandardCompare($1.filename) == .orderedAscending }
         return (files, "已启用")
+    }
+
+    private static func recheckSettling(_ previous: [WatchedFileSnapshot]) -> (files: [WatchedFileSnapshot], state: String)? {
+        var files = previous
+        for index in previous.indices {
+            let file = previous[index]
+            guard !file.stable, file.unavailableReason == nil else { continue }
+            // Reconcile from scratch if the path disappeared or became
+            // unreadable, including when the watched directory was moved.
+            guard let observed = metadataSnapshot(path: file.path, filename: file.filename) else { return nil }
+            files[index] = observed
+        }
+        return (files, "已启用")
+    }
+
+    private static func metadataSnapshot(path: String, filename: String) -> WatchedFileSnapshot? {
+        var metadata = stat()
+        guard Darwin.lstat(path, &metadata) == 0,
+              metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              metadata.st_flags & UInt32(UF_HIDDEN) == 0 else { return nil }
+        // SF_DATALESS identifies unhydrated File Provider files. Report them
+        // without opening or handing them to backend hashing/discovery.
+        let unavailableReason = placeholderReason(flags: metadata.st_flags)
+        let version = String(metadata.st_dev) + ":" + String(metadata.st_ino) + ":" +
+            String(metadata.st_size) + ":" +
+            String(metadata.st_mtimespec.tv_sec) + ":" + String(metadata.st_mtimespec.tv_nsec) + ":" +
+            String(metadata.st_ctimespec.tv_sec) + ":" + String(metadata.st_ctimespec.tv_nsec) + ":" +
+            String(metadata.st_flags)
+        return WatchedFileSnapshot(path: path, filename: filename, version: version, stable: false,
+                                   unavailableReason: unavailableReason)
     }
 
     static func placeholderReason(flags: UInt32) -> String? {

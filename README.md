@@ -1,6 +1,8 @@
-# AudioTranscribe 2.5.1
+# AudioTranscribe 2.5.3
 
 The native three-pane app watches the selected local recording folder while it runs, then starts ready new files only when **开始全部新录音** is clicked. Dragged/chosen recordings remain managed-copy imports. Each file becomes an independent, readable result; the app does not infer course membership or combine recordings. The default model is the standard-precision `large-v3-turbo`. `large-v3` remains an explicit alternative.
+
+**刷新** checks directory metadata and verifies new or changed recordings, reusing discoveries for unchanged files. The monitoring card shows when it is scanning, when recordings are waiting or being verified, and when the check is complete. It also shows how many recordings can start and how many need attention. Hold **Option** while clicking **刷新** to explicitly recheck every recording.
 
 The default **Auto** mode uses a measured, bounded number of independent whisper.cpp processes for a multi-file batch. Admission checks current memory and swapping, and the app displays the requested/admitted count. **Serial** always requests one. The preparation lane is bounded; completed files publish without waiting for slower neighbors. Both modes retain cross-instance ownership, cancellation, result verification, exact-source cache reuse, and crash recovery. The application does not gate or cancel jobs based on macOS thermal state. macOS hardware and driver protections remain in place.
 

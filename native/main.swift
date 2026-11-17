@@ -48,6 +48,8 @@ final class MainController: NSWindowController, NSWindowDelegate, NSTableViewDat
     let search = NSSearchField(), sortPicker = NSPopUpButton(), extraFilterPicker = NSPopUpButton()
     let watchPath = NSTextField(labelWithString: "尚未选择文件夹")
     let watchState = NSTextField(labelWithString: "未启用")
+    let watchDetail = NSTextField(labelWithString: "")
+    let watchSpinner = NSProgressIndicator()
     let sidebarFolderState = NSTextField(labelWithString: "未启用")
     let openFolder = NSButton(title: "打开文件夹", target: nil, action: nil)
     let changeFolder = NSButton(title: "更改…", target: nil, action: nil)
@@ -73,10 +75,7 @@ final class MainController: NSWindowController, NSWindowDelegate, NSTableViewDat
     var watchObservers: [NSObjectProtocol] = []
     var splitObservers: [NSObjectProtocol] = []
     var watchStatus = "未启用"
-    var manualVerifyActive = false
-    var manualVerifyRemaining = Set<String>()
-    var manualVerifyTotal = 0
-    var manualVerifyUnready = 0
+    var watchScanInProgress = false
     var visibleRows: [RecordingRowID] = []
     var selectedRowIdentity: RecordingRowID?
     var preferredSelectionRowID: RecordingRowID?
@@ -144,6 +143,10 @@ final class MainController: NSWindowController, NSWindowDelegate, NSTableViewDat
         }
         table.deleteSelection = { [weak self] in self?.deleteSelected() }
         watcher.onSnapshot = { [weak self] snapshot, state, changed in self?.handleWatchedSnapshot(snapshot, state: state, changedPaths: changed) }
+        watcher.onScanStarted = { [weak self] in
+            self?.watchScanInProgress = true
+            self?.updateWatchedCard()
+        }
         if startServices { restoreDeletion() }
         refresh()
         if startServices { refreshResults(); restoreWatchedFolder() }

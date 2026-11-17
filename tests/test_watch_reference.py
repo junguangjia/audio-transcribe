@@ -314,6 +314,82 @@ class WatchedReferenceTests(unittest.TestCase):
         self.assertEqual(new["state"], "ready")
         self.assertNotEqual(new["version_key"], ready["version_key"])
 
+    def native_discovery_request(self, *sources):
+        versions = {}
+        for path in sources:
+            stat = path.lstat()
+            mtime = divmod(stat.st_mtime_ns, 1_000_000_000)
+            ctime = divmod(stat.st_ctime_ns, 1_000_000_000)
+            versions[str(path)] = ":".join(str(value) for value in
+                (stat.st_dev, stat.st_ino, stat.st_size, *mtime, *ctime, getattr(stat, "st_flags", 0)))
+        return {"action": "discover", "folder": str(sources[0].parent), "paths": list(versions),
+                "stable_versions": versions}
+
+    def test_native_stability_skips_extra_wait_and_checks_hash_races(self):
+        from audio_transcribe import watch
+        fresh = self.source("native-stable.wav", 10)
+        stale = self.source("native-stale.wav", 20)
+        changing = self.source("native-changing.wav", 30)
+        request = self.native_discovery_request(fresh, stale, changing)
+
+        with stale.open("ab") as handle:
+            handle.write(b"changed after native observation")
+
+        def hash_while_replaced(path):
+            digest = storage.sha256_file(path)
+            if path == changing:
+                with path.open("ab") as handle:
+                    handle.write(b"changed during hashing")
+            return digest
+
+        with patch.object(watch, "sha256_file", side_effect=hash_while_replaced) as hashed:
+            rows = direct.direct_request(self.settings, request)["items"]
+
+        self.assertEqual([item["state"] for item in rows], ["ready", "copying", "copying"])
+        self.assertEqual([call.args[0] for call in hashed.call_args_list], [fresh, changing])
+        self.assertNotIn("source_sha256", rows[2])
+        self.assertEqual(rows[0]["source_sha256"], storage.sha256_file(fresh))
+        # Complete the simulated replacements with valid WAV data.
+        self.source(stale.name, 40)
+        self.source(changing.name, 50)
+        self.assertTrue(all(item["state"] == "ready" for item in direct.direct_request(
+            self.settings, self.native_discovery_request(stale, changing))["items"]))
+
+    def test_discovery_only_validates_matching_modern_and_legacy_records(self):
+        from audio_transcribe import library
+        modern = self.source("modern-match.wav", 10)
+        unrelated = self.source("unrelated-modern.wav", 20)
+        legacy = self.source("legacy-match.wav", 30)
+        results = export.build_independent(self.settings, [modern, unrelated], self.resolved)["results"]
+        self.report([legacy])
+        legacy_result = next(row for row in direct.direct_request(self.settings, {"action": "list"})["results"]
+                             if row["result_id"].startswith("legacy-source-"))
+
+        request = self.native_discovery_request(modern, legacy)
+        with (patch.object(direct, "_segments", wraps=direct._segments) as checked,
+              patch.object(direct, "_records", wraps=direct._records) as scanned,
+              patch.object(library, "_reports", side_effect=AssertionError("Batch reports cannot match a recording"))):
+            rows = direct.direct_request(self.settings, request)["items"]
+
+        self.assertEqual([item["state"] for item in rows], ["processed", "processed"])
+        self.assertEqual([item["result_id"] for item in rows], [results[0]["result_id"], legacy_result["result_id"]])
+        self.assertEqual(checked.call_count, 1)
+        scanned.assert_called_once_with(self.settings, source_keys={
+            (modern.name, storage.sha256_file(modern)), (legacy.name, storage.sha256_file(legacy))})
+
+        with patch.object(direct, "_records", wraps=direct._records) as scanned:
+            cached = direct.direct_request(self.settings, request)["items"]
+        self.assertEqual([item["result_id"] for item in cached], [item["result_id"] for item in rows])
+        scanned.assert_called_once_with(self.settings, source_keys={(legacy.name, storage.sha256_file(legacy))})
+
+        internal = direct._new_record(self.settings, rows[0]["result_id"])["internal"]
+        broken_run = (storage.locate_session(self.data, internal["session_id"]) /
+                      "transcript" / internal["run_id"] / "transcript.json")
+        broken_run.write_text("{}", encoding="utf-8")
+        rechecked = direct.direct_request(self.settings, request)["items"]
+        self.assertEqual((rechecked[0]["state"], rechecked[0]["result_id"]), ("ready", None))
+        self.assertEqual(rechecked[1]["result_id"], legacy_result["result_id"])
+
     def test_cached_source_reconciles_new_result_across_native_queue_identities(self):
         from audio_transcribe import watch
         original = self.source("late-result.wav", 10)

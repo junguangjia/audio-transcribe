@@ -179,7 +179,7 @@ def managed_source_path(session_path: Path | str, source: dict) -> Path:
     return resolved
 
 
-def source_stat(path: Path | str) -> dict:
+def source_stat(path: Path | str, *, include_flags=False) -> dict:
     """Cheap change token, never proof that two files contain equal bytes."""
     path = Path(path)
     value = path.lstat()
@@ -188,11 +188,15 @@ def source_stat(path: Path | str) -> dict:
     # Darwin sys/stat.h: SF_DATALESS means a File Provider placeholder has no
     # local data. Check before a caller can open/hash the source, including if
     # iCloud evicted it after the native watcher observed its metadata.
-    if getattr(value, "st_flags", 0) & 0x40000000:
+    flags = getattr(value, "st_flags", 0)
+    if flags & 0x40000000:
         raise ValueError("iCloud file is not downloaded; keep a local copy in Finder before processing.")
-    return {"device": value.st_dev, "inode": value.st_ino,
-            "size_bytes": value.st_size, "mtime_ns": value.st_mtime_ns,
-            "ctime_ns": value.st_ctime_ns}
+    result = {"device": value.st_dev, "inode": value.st_ino,
+              "size_bytes": value.st_size, "mtime_ns": value.st_mtime_ns,
+              "ctime_ns": value.st_ctime_ns}
+    if include_flags:
+        result["flags"] = flags
+    return result
 
 
 def _validate_referenced_source(source: dict) -> Path:
