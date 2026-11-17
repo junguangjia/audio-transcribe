@@ -62,7 +62,6 @@ extension MainController {
 
     func refreshWatchedFolder(forceVerify: Bool) {
         guard watcher.folder != nil else { return }
-        watchScanInProgress = true
         // A manual refresh also retries previous backend failures. Dataless
         // placeholders are retried only once the OS reports them as local.
         for (path, item) in watchedItems where ["failed", "unavailable"].contains(item.state) &&

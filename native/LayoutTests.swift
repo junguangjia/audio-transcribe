@@ -403,6 +403,9 @@ struct LayoutTests {
         controller.handleWatchedSnapshot(latest, state: "无法读取监控文件夹，请重试。", changedPaths: [])
         check(controller.watchState.stringValue == "文件夹检测受阻" && controller.watchDetail.stringValue.contains("无法读取监控文件夹"),
               "Folder error was hidden by pending recordings")
+        controller.refreshFolder.performClick(nil)
+        check(controller.watchState.stringValue == "文件夹检测受阻",
+              "Requesting a refresh hid the folder error before a scan actually started")
         let beforeRepeatedRefresh = publications
         controller.refreshFolder.performClick(nil)
         check(wait({ publications > beforeRepeatedRefresh }), "Repeated refresh did not publish metadata")
