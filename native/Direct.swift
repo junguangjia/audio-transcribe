@@ -72,7 +72,8 @@ struct DirectResult {
     }
     static func stateLabel(_ state: String) -> String {
         ["checking":"正在检查", "waiting":"等待转录", "processing":"正在转录", "ready":"新录音 · 等待开始",
-         "copying":"正在复制，稍后可用", "ignored":"已忽略 · 可重新加入", "unavailable":"暂时不可用",
+         "copying":"等待文件稳定", "watch_queued":"等待校验", "watch_checking":"正在校验文件",
+         "ignored":"已忽略 · 可重新加入", "unavailable":"暂时不可用",
          "completed":"已完成", "review_required":"已生成 · 需复核", "failed":"失败 · 可重试",
          "cancelled":"已取消"][state] ?? "历史结果"
     }

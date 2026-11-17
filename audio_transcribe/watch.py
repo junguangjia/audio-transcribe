@@ -55,6 +55,13 @@ def _metadata_key(path, stat):
     return hashlib.sha256(json.dumps([str(path), stat], sort_keys=True).encode()).hexdigest()
 
 
+def _native_version(observed, flags):
+    modified = divmod(observed["mtime_ns"], 1_000_000_000)
+    changed = divmod(observed["ctime_ns"], 1_000_000_000)
+    return ":".join(map(str, (observed["device"], observed["inode"], observed["size_bytes"],
+                              *modified, *changed, flags)))
+
+
 def _record_index(records):
     by_hash = {}
     for identity, record in records.items():
@@ -100,14 +107,39 @@ def _result_for_hash(settings, path, digest, index):
 
 
 def _cached_result_for_hash(settings, path, digest, identity):
-    """Validate one prior link without scanning the entire result library."""
-    if not isinstance(identity, str) or not identity:
+    """Validate a modern link directly. Historical links share a candidate scan."""
+    if not isinstance(identity, str) or not identity.startswith("r-"):
         return None
     from .direct import _record_for_identity
     record = _record_for_identity(settings, identity)
     if record is None:
         return None
     return _result_for_hash(settings, path, digest, {digest: [(identity, record)]})
+
+
+def _resolve_result_links(settings, pending, updates):
+    if not pending:
+        return
+    from .direct import _records
+
+    source_keys = {(path.name, entry["sha256"]) for path, entry, _ in pending}
+    records = _records(settings, source_keys=source_keys)
+    index = _record_index(records)
+    for path, entry, item in pending:
+        digest = entry["sha256"]
+        preferred = entry.get("result_id")
+        result_id = None
+        if isinstance(preferred, str) and preferred.startswith("legacy-source-") and preferred in records:
+            # Keep a previously linked valid historical result in preference
+            # to another matching run. Its record is already in this scan.
+            result_id = _result_for_hash(settings, path, digest, {digest: [(preferred, records[preferred])]})
+        if result_id is None:
+            result_id = _result_for_hash(settings, path, digest, index)
+        if result_id is not None:
+            item["state"] = "processed_candidate" if "verification" in item else "processed"
+        item["result_id"] = result_id
+        if result_id != entry.get("result_id"):
+            updates[item["path"]] = {**entry, "result_id": result_id}
 
 
 def discover(settings, request):
@@ -128,6 +160,12 @@ def discover(settings, request):
     if not isinstance(changed, list) or any(raw not in paths for raw in changed):
         raise ValueError("Changed paths must be among the discovered files.")
     changed = set(changed)
+    stable_versions = request.get("stable_versions", {})
+    if not isinstance(stable_versions, dict) or any(
+        raw not in paths or not isinstance(version, str) or len(version) > 160
+        for raw, version in stable_versions.items()
+    ):
+        raise ValueError("Stable versions must describe files in this discovery request.")
     with _locked(settings):
         saved = _load(settings)
         previous = {raw: saved["files"].get(raw) for raw in paths}
@@ -136,7 +174,7 @@ def discover(settings, request):
     now = time.time()
     items = []
     updates = {}
-    index = None
+    pending = []
     for raw in paths:
         path = Path(raw)
         base = {"path": raw, "filename": path.name}
@@ -145,18 +183,22 @@ def discover(settings, request):
             items.append({**base, "state": "unavailable", "message": "Temporary or unsupported file."})
             continue
         try:
-            observed = source_stat(path)
+            observed = source_stat(path, include_flags=True)
         except (OSError, ValueError) as error:
             items.append({**base, "state": "unavailable", "message": str(error)})
             continue
+        flags = observed.pop("flags")
+        native_stable = raw in stable_versions and stable_versions[raw] == _native_version(observed, flags)
         provisional_key = _metadata_key(path, observed)
         # Legacy cache entries lack ctime_ns. They intentionally fail this
         # comparison, settle again, and receive a new full-byte hash.
         if old.get("stat") != observed:
-            updates[raw] = {"stat": observed, "first_seen": now}
-            items.append({**base, "state": "copying", "version_key": provisional_key,
-                          "message": "Waiting for a stable file observation."})
-            continue
+            old = {"stat": observed, "first_seen": now}
+            updates[raw] = old
+            if not native_stable:
+                items.append({**base, "state": "copying", "version_key": provisional_key,
+                              "message": "Waiting for a stable file observation."})
+                continue
         if raw not in changed and not old.get("revalidate") and old.get("sha256") and old.get("version_key"):
             key = old["version_key"]
             if key in ignored:
@@ -172,20 +214,17 @@ def discover(settings, request):
                 # validates the exact external path and saved run; it never
                 # re-hashes the original audio.
                 result_id = _cached_result_for_hash(settings, path, old["sha256"], old.get("result_id"))
-                if result_id is None:
-                    if index is None:
-                        from .direct import _records
-                        index = _record_index(_records(settings))
-                    result_id = _result_for_hash(settings, path, old["sha256"], index)
                 state = "processed_candidate" if result_id else "ready"
-            if result_id != old.get("result_id"):
+            item = {**base, "state": state, "version_key": key, "result_id": result_id,
+                    "verification": "metadata_candidate",
+                    "message": "Previously verified bytes; metadata is unchanged. Revalidated before processing."}
+            if state == "ready":
+                pending.append((path, old, item))
+            elif result_id != old.get("result_id"):
                 updates[raw] = {**old, "result_id": result_id}
-            items.append({**base, "state": state, "version_key": key,
-                          "result_id": result_id,
-                          "verification": "metadata_candidate",
-                          "message": "Previously verified bytes; metadata is unchanged. Revalidated before processing."})
+            items.append(item)
             continue
-        if not old.get("revalidate") and now - old.get("first_seen", 0) < _STABLE_SECONDS:
+        if not native_stable and not old.get("revalidate") and now - old.get("first_seen", 0) < _STABLE_SECONDS:
             items.append({**base, "state": "copying", "version_key": provisional_key,
                           "message": "Waiting for the recording to finish copying."})
             continue
@@ -202,24 +241,26 @@ def discover(settings, request):
                 continue
         try:
             digest = sha256_file(path)
-            if source_stat(path) != observed:
-                updates[raw] = {"stat": source_stat(path), "first_seen": now}
+            verified = source_stat(path, include_flags=True)
+            verified_flags = verified.pop("flags")
+            if verified != observed or verified_flags != flags:
+                updates[raw] = {"stat": verified, "first_seen": now}
                 items.append({**base, "state": "copying", "version_key": provisional_key,
                               "message": "File changed while verifying; waiting for stability."})
                 continue
             key = version_key(path, digest)
-            if index is None:
-                from .direct import _records
-                index = _record_index(_records(settings))
-            result_id = _result_for_hash(settings, path, digest, index)
-            state = "ignored" if key in ignored else "processed" if result_id else "ready"
-            updates[raw] = {"stat": observed, "first_seen": old.get("first_seen", now),
-                            "sha256": digest, "version_key": key, "result_id": result_id}
-            items.append({**base, "state": state, "version_key": key,
-                          "source_sha256": digest, "result_id": result_id})
+            state = "ignored" if key in ignored else "ready"
+            entry = {"stat": observed, "first_seen": old.get("first_seen", now),
+                     "sha256": digest, "version_key": key, "result_id": None}
+            updates[raw] = entry
+            item = {**base, "state": state, "version_key": key, "source_sha256": digest, "result_id": None}
+            if state == "ready":
+                pending.append((path, entry, item))
+            items.append(item)
         except (OSError, ValueError) as error:
             items.append({**base, "state": "unavailable", "version_key": provisional_key,
                           "message": str(error)})
+    _resolve_result_links(settings, pending, updates)
     if updates:
         with _locked(settings):
             saved = _load(settings)

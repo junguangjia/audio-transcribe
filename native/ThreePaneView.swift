@@ -225,13 +225,22 @@ extension MainController {
         watchPath.lineBreakMode = .byTruncatingMiddle; watchPath.toolTip = watchPath.stringValue
         let folderText = NSStackView(views: [folderHeading, watchPath]); folderText.orientation = .vertical
         folderText.alignment = .leading; folderText.spacing = 2
-        let header = NSStackView(views: [folderIcon, folderText, NSView(), watchState]); header.spacing = 8
+        watchSpinner.style = .spinning
+        watchSpinner.controlSize = .small
+        watchSpinner.isDisplayedWhenStopped = false
+        let header = NSStackView(views: [folderIcon, folderText, NSView(), watchSpinner, watchState]); header.spacing = 8
         cardStack.addArrangedSubview(header); header.widthAnchor.constraint(equalTo: cardStack.widthAnchor).isActive = true
         watchState.font = .systemFont(ofSize: 11); watchState.textColor = .secondaryLabelColor
         watchState.setContentCompressionResistancePriority(.required, for: .horizontal)
+        watchDetail.font = .systemFont(ofSize: 11)
+        watchDetail.textColor = .secondaryLabelColor
+        watchDetail.lineBreakMode = .byTruncatingTail
+        cardStack.addArrangedSubview(watchDetail)
+        watchDetail.widthAnchor.constraint(equalTo: cardStack.widthAnchor).isActive = true
         openFolder.target = self; openFolder.action = #selector(openWatchedFolder)
         changeFolder.target = self; changeFolder.action = #selector(chooseWatchedFolder)
-        refreshFolder.target = self; refreshFolder.action = #selector(refreshWatchedFolder)
+        refreshFolder.target = self; refreshFolder.action = #selector(refreshWatchedFolder as () -> Void)
+        refreshFolder.toolTip = "检查新增或变化的录音；按住 Option 点击可重新核对全部文件。"
         startAll.target = self; startAll.action = #selector(startAllNew)
         for button in [openFolder, changeFolder, refreshFolder, startAll] { button.bezelStyle = .rounded }
         let controls = NSStackView(views: [openFolder, changeFolder, refreshFolder, NSView(), startAll]); controls.spacing = 6
@@ -264,11 +273,43 @@ extension MainController {
         watchPath.stringValue = folder?.path ?? "尚未选择文件夹"
         watchPath.toolTip = folder?.path
         let ready = watchedItems.values.filter { $0.state == "ready" && !isAlreadyQueued($0) && !isWatchDeletionFenced($0) }.count
+        let pending = watchedSnapshots.values.filter { needsWatchedDiscovery($0) }
+        let settling = pending.filter { watchedItems[$0.path]?.state == "copying" }.count
+        let issues = watchedItems.values.filter { ["failed", "unavailable"].contains($0.state) }.count
         startAll.title = "开始全部新录音（\(ready)）"
         startAll.isEnabled = ready > 0
         openFolder.isEnabled = folder != nil
-        watchState.stringValue = folder == nil ? "未启用" : watchStatus
-        watchState.textColor = folder != nil && watchStatus.hasPrefix("已启用") ? .systemGreen : .secondaryLabelColor
-        sidebarFolderState.stringValue = folder == nil ? "未启用" : watchStatus
+        refreshFolder.isEnabled = folder != nil
+        let folderProblem = watchStatus.hasPrefix("无法读取") || watchStatus.hasPrefix("文件夹")
+        let active = folder != nil && (watchScanInProgress || (!folderProblem && !pending.isEmpty))
+        var details: [String] = []
+        if folder == nil {
+            watchState.stringValue = "未启用"
+        } else if watchScanInProgress {
+            watchState.stringValue = "正在检查文件夹…"
+        } else if folderProblem {
+            watchState.stringValue = "文件夹检测受阻"
+            details.append(watchStatus)
+        } else if !pending.isEmpty {
+            watchState.stringValue = "正在检测录音…"
+        } else if watchStatus.hasPrefix("已启用") {
+            watchState.stringValue = issues == 0 ? "检查完成" : "检查完成 · 有未就绪"
+        } else {
+            watchState.stringValue = "监控状态"
+            details.append(watchStatus)
+        }
+        if settling > 0 { details.append("\(settling) 个等待文件稳定") }
+        if pending.count > settling { details.append("\(pending.count - settling) 个正在或等待校验") }
+        if ready > 0 { details.append("\(ready) 个可开始") }
+        if issues > 0 { details.append("\(issues) 个未就绪") }
+        if folder != nil, details.isEmpty, !active { details.append("没有新录音") }
+        watchDetail.stringValue = details.joined(separator: " · ")
+        watchDetail.toolTip = watchDetail.stringValue
+        watchDetail.isHidden = watchDetail.stringValue.isEmpty
+        if active { watchSpinner.startAnimation(nil) } else { watchSpinner.stopAnimation(nil) }
+        watchState.textColor = active ? .controlAccentColor :
+            watchState.stringValue == "检查完成" ? .systemGreen : .secondaryLabelColor
+        sidebarFolderState.stringValue = watchState.stringValue
+        sidebarFolderState.toolTip = watchDetail.stringValue
     }
 }

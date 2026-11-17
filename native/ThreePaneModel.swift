@@ -29,7 +29,7 @@ enum RecordingFilter: Int, CaseIterable {
         switch self {
         case .all: return true
         case .processing: return ["checking", "processing", "transcribing"].contains(state)
-        case .waiting: return ["ready", "copying", "waiting", "unavailable"].contains(state)
+        case .waiting: return ["ready", "copying", "watch_queued", "watch_checking", "waiting", "unavailable"].contains(state)
         case .completed: return ["completed", "review_required"].contains(state)
         case .review: return state == "review_required"
         case .failed: return state == "failed"

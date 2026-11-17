@@ -21,7 +21,7 @@ from . import lifecycle
 from .direct_metadata import recording_metadata
 from .evaluation import timestamp
 from .product import APP_VERSION, APP_BUILD
-from .storage import (_file_lock, _write_atomic, locate_session, resolve_source_path, source_stat,
+from .storage import (_file_lock, _json_value, _write_atomic, locate_session, resolve_source_path, source_stat,
                       read_doc, sha256_file, validate_id, write_json, write_yaml, session_lock)
 
 SCHEMA = "audiotranscribe/v1"
@@ -307,11 +307,21 @@ def _publish_result(settings, entry, segments, resolved, runtime, model, info=No
     return _summary(identity, document, final / "transcript.md", context[3])
 
 
-def _new_record(settings, identity):
+def _new_record(settings, identity, *, source_keys=None):
     validate_id(identity, "result ID")
     root = _root(settings) / "results"
     path = _inside(root, root / identity / "result.json")
-    saved = read_doc(path)
+    if source_keys is None:
+        saved = read_doc(path)
+    else:
+        # A discovery lookup needs only filename and digest to rule out most
+        # documents. Matching records still go through the full validation.
+        with path.open(encoding="utf-8") as handle:
+            saved = json.load(handle)
+        source = saved["document"]["source"]
+        if (source["filename"], source.get("sha256")) not in source_keys:
+            return None
+        _json_value(saved)
     if (saved.get("schema_version") != 1 or saved.get("result_id") != identity
             or saved.get("document_sha256") != _digest(saved.get("document"))
             or saved.get("internal_sha256") != _digest(saved.get("internal"))):
@@ -322,7 +332,7 @@ def _new_record(settings, identity):
     return saved
 
 
-def _legacy_records(settings):
+def _legacy_records(settings, *, source_keys=None):
     """Metadata-only discovery. Reading a result separately verifies its artifacts."""
     root = _root(settings)
     sessions = list((root / "sessions").glob("*/session.yaml")) + list((root / "archive").glob("[0-9][0-9][0-9][0-9]/*/session.yaml"))
@@ -333,6 +343,12 @@ def _legacy_records(settings):
             session = read_doc(session_file)
             if session_file.parent.name != validate_id(session.get("id"), "session ID"):
                 continue
+            sources = session.get("sources", [])
+            if source_keys is not None:
+                sources = [source for source in sources if isinstance(source, dict)
+                           and (source.get("original_basename"), source.get("sha256")) in source_keys]
+                if not sources:
+                    continue
             for mpath in session_file.parent.glob("transcript/*/manifest.json"):
                 if not mpath.resolve().is_relative_to(session_file.parent.resolve()):
                     continue
@@ -342,7 +358,7 @@ def _legacy_records(settings):
                 if m.get("run_id") != mpath.parent.name or m.get("session_id") != session["id"]:
                     continue
                 covered = {c.get("source_id") for c in m.get("coverage", [])}
-                for source in session.get("sources", []):
+                for source in sources:
                     if source.get("id") not in covered:
                         continue
                     identity = "legacy-source-" + _digest([str(mpath.relative_to(root)), source["id"]])[:32]
@@ -359,6 +375,8 @@ def _legacy_records(settings):
                                      "run_path": mpath.parent, "manifest": m, "coverage": coverage}
         except (OSError, ValueError, KeyError, TypeError, StopIteration):
             continue
+    if source_keys is not None:
+        return
     # Keep old complete batch reports accessible as historical documents only.
     from .library import _reports
     for old_id, (summary, manifest, path) in _reports(root).items():
@@ -376,19 +394,21 @@ def _legacy_records(settings):
                                     "audio_path": None, "generated_at": manifest.get("created_at"), "legacy": True, "labels_editable": False}}
 
 
-def _records(settings, *, include_deleted=False):
+def _records(settings, *, include_deleted=False, source_keys=None):
     found = {}
     adopted = set()
     for path in (_root(settings) / "results").glob("r-*/result.json"):
         try:
-            saved = _new_record(settings, path.parent.name)
+            saved = _new_record(settings, path.parent.name, source_keys=source_keys)
+            if saved is None:
+                continue
             internal = saved["internal"]
             adopted.add((internal["session_id"], internal["source_id"], internal["run_id"]))
             found[path.parent.name] = {"kind": "new", "saved": saved,
                 "summary": _summary(path.parent.name, saved["document"], path.parent / "transcript.md", internal["audio_path"])}
         except (OSError, ValueError, KeyError, TypeError):
             continue
-    for identity, record in _legacy_records(settings):
+    for identity, record in _legacy_records(settings, source_keys=source_keys):
         if record["kind"] == "source" and (record["session_path"].name, record["source"]["id"], record["run_path"].name) in adopted:
             continue
         if identity in found:

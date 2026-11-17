@@ -79,8 +79,10 @@ extension MainController {
                 return "已忽略 · 可重新加入"
             }
             switch item.state {
-            case "ready": return "新录音 · 等待开始"
-            case "copying": return "正在复制，稍后可用"
+            case "ready": return "检查完成 · 可以开始"
+            case "copying": return "等待文件稳定"
+            case "watch_queued": return "等待校验"
+            case "watch_checking": return "正在校验文件"
             case "ignored": return "已忽略 · 可重新加入"
             case "unavailable": return item.message ?? "暂时不可用"
             case "failed": return item.message ?? "文件检查失败"

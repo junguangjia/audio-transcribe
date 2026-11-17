@@ -295,16 +295,24 @@ struct LayoutTests {
         let filename = String(repeating: "A long synthetic recording name ", count: 6) + ".wav"
         let long = Recording(url: URL(fileURLWithPath: "/synthetic-layout/" + filename))
         controller.queue.items = [long]; controller.results = []; controller.watchedItems = [:]; controller.refresh()
+        // AppKit can restore the split's layout immediately after setPosition
+        // in a hidden fixture. Resize the window to drive actual table width.
         controller.window?.setContentSize(NSSize(width: 1800, height: 1000)); settle(controller)
-        controller.contentSplit.setPosition(900, ofDividerAt: 0); settle(controller)
         controller.table.reloadData(); controller.activateVisibleRow(.job(long.id)); settle(controller)
         let wideHeight = controller.table.rect(ofRow: 0).height
-        controller.contentSplit.setPosition(345, ofDividerAt: 0); settle(controller)
+        let wideWidth = controller.table.bounds.width
+        controller.window?.setContentSize(NSSize(width: 1150, height: 1000)); settle(controller)
         let narrowHeight = controller.table.rect(ofRow: 0).height
-        check(narrowHeight > wideHeight && abs(narrowHeight - controller.tableView(controller.table, heightOfRow: 0)) <= tolerance, "Narrow divider left cached long-filename row height")
-        controller.contentSplit.setPosition(900, ofDividerAt: 0); settle(controller)
-        check(abs(controller.table.rect(ofRow: 0).height - wideHeight) <= tolerance, "Wide divider left expanded long-filename row height")
-        selectedJobIsAligned(long, context: "divider resize")
+        let expectedNarrowHeight = controller.tableView(controller.table, heightOfRow: 0)
+        let narrowWidth = controller.table.bounds.width
+        check(narrowWidth < wideWidth && expectedNarrowHeight > wideHeight,
+              "The row-height fixture did not narrow the table enough to wrap the filename (\(wideWidth) → \(narrowWidth))")
+        check(abs(narrowHeight - expectedNarrowHeight) <= tolerance,
+              "Narrow table left cached long-filename row height (\(wideHeight) → \(narrowHeight), expected \(expectedNarrowHeight))")
+        controller.window?.setContentSize(NSSize(width: 1800, height: 1000)); settle(controller)
+        check(abs(controller.table.bounds.width - wideWidth) <= tolerance, "The row-height fixture did not restore the original table width")
+        check(abs(controller.table.rect(ofRow: 0).height - wideHeight) <= tolerance, "Wide table left expanded long-filename row height")
+        selectedJobIsAligned(long, context: "table resize")
         check(controller.process == nil, "Controller regressions started an ASR process")
     }
 
@@ -325,6 +333,113 @@ struct LayoutTests {
         controller.restoreWatchedFolder()
         check(controller.watcher.folder?.standardizedFileURL == directory.standardizedFileURL, "Saved watched folder was not restored")
         check(defaults.string(forKey: "WatchedFolderPath") == directory.standardizedFileURL.path, "Saved watched folder path was replaced")
+    }
+
+    static func incrementalWatchedRefreshRegression() throws {
+        let suite = "AudioTranscribe.IncrementalWatchTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("audio-transcribe-incremental-watch-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        for index in 0..<32 {
+            try Data("synthetic metadata fixture \(index)".utf8).write(to: directory.appendingPathComponent("existing-\(index).wav"))
+        }
+        let controller = MainController(defaults: defaults, startServices: false)
+        defer { controller.prepareForQuit(); controller.window?.orderOut(nil) }
+        controller.configureWatchedFolder(directory)
+        // Hold the two discovery admission slots to inspect exactly which
+        // files the real controller queues, without launching backend helpers.
+        controller.discoveryInFlight = 2
+        var latest: [WatchedFileSnapshot] = []
+        var publications = 0
+        controller.watcher.onSnapshot = { files, _, _ in latest = files; publications += 1 }
+        func wait(_ condition: () -> Bool) -> Bool {
+            let end = Date().addingTimeInterval(4)
+            while Date() < end {
+                if condition() { return true }
+                RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.02))
+            }
+            return condition()
+        }
+        guard wait({ latest.count == 32 && latest.allSatisfy(\.stable) }) else {
+            check(false, "Incremental refresh fixture did not settle")
+            return
+        }
+        func finishSyntheticDiscovery() {
+            controller.watchedSnapshots = Dictionary(uniqueKeysWithValues: latest.map { ($0.path, $0) })
+            controller.discoveredVersions = Dictionary(uniqueKeysWithValues: latest.map { ($0.path, $0.version) })
+            controller.watchedItems = Dictionary(uniqueKeysWithValues: latest.map { item in
+                (item.path, WatchedDiscovery(["path": item.path, "filename": item.filename,
+                    "state": "ready", "version_key": String(repeating: "a", count: 64)])!)
+            })
+            controller.discoveringPaths.removeAll(); controller.discoveryQueuedPaths.removeAll()
+            controller.discoveryForces.removeAll()
+        }
+        finishSyntheticDiscovery()
+        controller.watcher.onSnapshot = { [weak controller] files, state, changed in
+            latest = files; publications += 1
+            controller?.handleWatchedSnapshot(files, state: state, changedPaths: changed)
+        }
+        let beforeRefresh = publications
+        controller.refreshFolder.performClick(nil)
+        check(wait({ publications > beforeRefresh }), "Refresh button did not request a folder snapshot")
+        check(controller.discoveringPaths.isEmpty && controller.discoveryQueuedPaths.isEmpty,
+              "Ordinary refresh requeued unchanged recordings for verification")
+        check(wait({ controller.watchState.stringValue == "检查完成" }),
+              "Ordinary refresh did not reach a visible completion state")
+        check(controller.watchDetail.stringValue.contains("32 个可开始"), "Completed check did not show the ready count")
+
+        let added = directory.appendingPathComponent("new-recording.wav")
+        try Data("synthetic new file".utf8).write(to: added)
+        controller.refreshFolder.performClick(nil)
+        check(wait({ controller.discoveryQueuedPaths.contains(added.path) }),
+              "Refresh did not discover a newly added recording")
+        check(Set(controller.discoveringPaths.map(\.0)) == Set([added.path]),
+              "Adding one recording requeued existing recordings")
+        check(controller.watchState.stringValue == "正在检测录音…" &&
+              controller.watchDetail.stringValue.contains("1 个正在或等待校验"),
+              "A new recording waiting for verification did not show progress")
+        controller.handleWatchedSnapshot(latest, state: "无法读取监控文件夹，请重试。", changedPaths: [])
+        check(controller.watchState.stringValue == "文件夹检测受阻" && controller.watchDetail.stringValue.contains("无法读取监控文件夹"),
+              "Folder error was hidden by pending recordings")
+        let beforeRepeatedRefresh = publications
+        controller.refreshFolder.performClick(nil)
+        check(wait({ publications > beforeRepeatedRefresh }), "Repeated refresh did not publish metadata")
+        check(controller.discoveringPaths.filter { $0.0 == added.path }.count == 1,
+              "Repeated refresh duplicated a recording already awaiting verification")
+        finishSyntheticDiscovery()
+
+        let changed = directory.appendingPathComponent("existing-0.wav")
+        let oldVersion = controller.discoveredVersions[changed.path]
+        try Data("synthetic replacement with a different length".utf8).write(to: changed)
+        controller.refreshFolder.performClick(nil)
+        check(wait({ controller.discoveryQueuedPaths.contains(changed.path) }),
+              "Refresh did not reverify a recording whose metadata changed")
+        check(controller.watchedSnapshots[changed.path]?.version != oldVersion &&
+              Set(controller.discoveringPaths.map(\.0)) == Set([changed.path]),
+              "Changing one recording failed to isolate its verification")
+        finishSyntheticDiscovery()
+
+        let removed = directory.appendingPathComponent("existing-31.wav")
+        try FileManager.default.removeItem(at: removed)
+        controller.refreshFolder.performClick(nil)
+        check(wait({ controller.watchedSnapshots[removed.path] == nil }),
+              "Refresh retained a deleted recording in the metadata snapshot")
+        check(controller.watchedItems[removed.path] == nil && controller.discoveredVersions[removed.path] == nil,
+              "Refresh retained a deleted recording in discovery state")
+        check(controller.discoveringPaths.isEmpty, "Deleting one recording requeued unchanged recordings")
+
+        let beforeExplicitVerification = publications
+        controller.refreshWatchedFolder(forceVerify: true)
+        check(wait({ publications > beforeExplicitVerification &&
+            controller.discoveryQueuedPaths == Set(latest.map(\.path)) }),
+              "Explicit full verification did not queue the complete current folder")
+        check(controller.watchState.stringValue == "正在检测录音…" &&
+              controller.watchDetail.stringValue.contains("\(latest.count) 个正在或等待校验"),
+              "Explicit full verification lost its progress count")
+        check(controller.discoveryRequests.isEmpty && controller.process == nil,
+              "Incremental refresh regressions launched backend or ASR processes")
     }
 
     static func cleanupAlignmentRegression(_ controller: MainController) {
@@ -404,6 +519,7 @@ struct LayoutTests {
         cleanupAlignmentRegression(controller)
         try controllerRegressions()
         try watchedFolderDefaultsRegression()
+        try incrementalWatchedRefreshRegression()
         let report: [String: Any] = ["fixture": "synthetic-production-AppKit-view-tree", "production_services_started": false,
             "passed": failures.isEmpty, "failures": failures, "measurements": measurements]
         let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])

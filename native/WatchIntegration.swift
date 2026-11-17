@@ -34,7 +34,7 @@ extension MainController {
         watcher.stop(); watchedItems.removeAll(); watchedSnapshots.removeAll(); watchedFirstSeen.removeAll()
         discoveredVersions.removeAll(); discoveringPaths.removeAll(); discoveryQueuedPaths.removeAll()
         discoveryForces.removeAll(); discoveryRetryCounts.removeAll(); discoveryInFlight = 0
-        manualVerifyActive = false; manualVerifyRemaining.removeAll(); manualVerifyTotal = 0; manualVerifyUnready = 0
+        watchScanInProgress = true
         defaults.set(selected.path, forKey: "WatchedFolderPath")
         watchStatus = "正在检查"; updateWatchedCard(); rebuildRows()
         watcher.start(selected)
@@ -57,147 +57,207 @@ extension MainController {
     }
 
     @objc func refreshWatchedFolder() {
-        guard watcher.folder != nil else { return }
-        manualVerifyActive = true; manualVerifyRemaining.removeAll(); manualVerifyTotal = 0; manualVerifyUnready = 0
-        watchStatus = "正在核对文件…"; updateWatchedCard()
-        watcher.refresh(forceVerify: true)
+        refreshWatchedFolder(forceVerify: NSApp.currentEvent?.modifierFlags.contains(.option) == true)
     }
 
-    func updateManualVerifyProgress() {
-        guard manualVerifyActive else { return }
-        if manualVerifyRemaining.isEmpty {
-            manualVerifyActive = false
-            watchStatus = manualVerifyUnready == 0 ?
-                (watcher.usingPolling ? "已启用（定时检查）" : "已启用") :
-                "已核对；\(manualVerifyUnready) 个文件未就绪"
-        } else {
-            watchStatus = "正在核对 \(manualVerifyTotal - manualVerifyRemaining.count)/\(manualVerifyTotal)"
+    func refreshWatchedFolder(forceVerify: Bool) {
+        guard watcher.folder != nil else { return }
+        watchScanInProgress = true
+        // A manual refresh also retries previous backend failures. Dataless
+        // placeholders are retried only once the OS reports them as local.
+        for (path, item) in watchedItems where ["failed", "unavailable"].contains(item.state) &&
+            watchedSnapshots[path]?.unavailableReason == nil {
+            discoveredVersions.removeValue(forKey: path)
+            discoveryRetryCounts.removeValue(forKey: path)
         }
         updateWatchedCard()
+        watcher.refresh(forceVerify: forceVerify)
+    }
+
+    func needsWatchedDiscovery(_ file: WatchedFileSnapshot) -> Bool {
+        file.unavailableReason == nil &&
+            (discoveredVersions[file.path] != file.version || discoveryForces.contains(file.path))
+    }
+
+    private func pendingWatchedItem(_ file: WatchedFileSnapshot, state: String, message: String? = nil) -> WatchedDiscovery? {
+        var value: [String: Any] = ["path": file.path, "filename": file.filename,
+                                   "state": state, "version_key": file.version]
+        if let message { value["message"] = message }
+        return WatchedDiscovery(value)
     }
 
     func handleWatchedSnapshot(_ files: [WatchedFileSnapshot], state: String, changedPaths: Set<String>) {
         guard let folder = watcher.folder else { return }
-        if !state.hasPrefix("已启用") { manualVerifyActive = false; watchStatus = state }
-        else if !manualVerifyActive { watchStatus = state }
+        watchScanInProgress = watcher.checkingDirectory
+        watchStatus = state
         let current = Dictionary(uniqueKeysWithValues: files.map { ($0.path, $0) })
-        if manualVerifyActive && manualVerifyTotal == 0 {
-            manualVerifyRemaining = Set(files.filter { $0.unavailableReason == nil }.map(\.path))
-            manualVerifyTotal = manualVerifyRemaining.count
-            manualVerifyUnready = files.count - manualVerifyTotal
-            updateManualVerifyProgress()
-        }
         let missing = Set(watchedSnapshots.keys).subtracting(current.keys)
-        let changedVersions = Set(current.compactMap { path, snapshot -> String? in
-            guard let old = watchedSnapshots[path], old.version != snapshot.version else { return nil }
-            return path
+        let changedVersions = Set(files.compactMap { file -> String? in
+            guard let old = watchedSnapshots[file.path], old.version != file.version else { return nil }
+            return file.path
         })
         for path in changedPaths.union(missing).union(changedVersions) {
             reader.invalidateExternalSource(at: path)
         }
         for path in missing {
-            watchedItems.removeValue(forKey: path); discoveredVersions.removeValue(forKey: path)
-            watchedFirstSeen.removeValue(forKey: path); discoveryQueuedPaths.remove(path)
+            watchedItems.removeValue(forKey: path)
+            discoveredVersions.removeValue(forKey: path)
+            watchedFirstSeen.removeValue(forKey: path)
+            discoveryForces.remove(path)
             discoveryRetryCounts.removeValue(forKey: path)
         }
+        for path in changedVersions { discoveryRetryCounts.removeValue(forKey: path) }
         watchedSnapshots = current
-        discoveryForces.formUnion(changedPaths.intersection(current.keys))
+        discoveryForces.formUnion(files.lazy.filter { $0.unavailableReason == nil && changedPaths.contains($0.path) }.map(\.path))
+        let now = Date().timeIntervalSince1970
         for file in files {
-            watchedFirstSeen[file.path] = watchedFirstSeen[file.path] ?? Date().timeIntervalSince1970
+            watchedFirstSeen[file.path] = watchedFirstSeen[file.path] ?? now
             if let reason = file.unavailableReason {
-                watchedItems[file.path] = WatchedDiscovery(["path": file.path, "filename": file.filename,
-                    "state": "unavailable", "version_key": file.version, "message": reason])
+                watchedItems[file.path] = pendingWatchedItem(file, state: "unavailable", message: reason)
                 discoveredVersions[file.path] = file.version
-                continue
-            }
-            if !file.stable {
-                if discoveredVersions[file.path] != file.version {
-                    discoveryRetryCounts.removeValue(forKey: file.path)
-                    watchedItems[file.path] = WatchedDiscovery(["path": file.path, "filename": file.filename,
-                                                                 "state": "copying", "version_key": file.version,
-                                                                 "message": "正在复制，稍后可用"])
-                }
-                continue
-            }
-            if (discoveredVersions[file.path] != file.version || discoveryForces.contains(file.path)), !discoveryQueuedPaths.contains(file.path) {
-                discoveringPaths.append((file.path, file.version)); discoveryQueuedPaths.insert(file.path)
+                discoveryForces.remove(file.path)
+            } else if needsWatchedDiscovery(file), !file.stable {
+                watchedItems[file.path] = pendingWatchedItem(file, state: "copying")
             }
         }
-        updateWatchedCard(); rebuildRows(); drainDiscovery(folder: folder)
+        enqueueWatchedDiscovery()
+        drainDiscovery(folder: folder)
+        rebuildRows()
+    }
+
+    private func enqueueWatchedDiscovery() {
+        let candidates = watchedSnapshots.values.filter {
+            $0.stable && needsWatchedDiscovery($0) &&
+                !discoveryQueuedPaths.contains($0.path) && discoveryRetryCounts[$0.path] == nil
+        }
+        for file in candidates {
+            discoveringPaths.append((file.path, file.version))
+            discoveryQueuedPaths.insert(file.path)
+            watchedItems[file.path] = pendingWatchedItem(file, state: "watch_queued")
+        }
+        if !candidates.isEmpty {
+            // New arrivals should be checked ahead of the startup backlog.
+            discoveringPaths.sort {
+                let lhs = watchedFirstSeen[$0.0] ?? 0
+                let rhs = watchedFirstSeen[$1.0] ?? 0
+                return lhs == rhs ? $0.0 < $1.0 : lhs > rhs
+            }
+        }
     }
 
     func drainDiscovery(folder: URL) {
         guard watcher.folder?.path == folder.path else { return }
         while discoveryInFlight < 2, !discoveringPaths.isEmpty {
-            let batch = Array(discoveringPaths.prefix(3)); discoveringPaths.removeFirst(min(3, discoveringPaths.count))
+            let queued = Array(discoveringPaths.prefix(8))
+            discoveringPaths.removeFirst(queued.count)
+            let batch = queued.filter { path, version in
+                guard let file = watchedSnapshots[path], file.version == version, file.stable,
+                      needsWatchedDiscovery(file) else {
+                    discoveryQueuedPaths.remove(path)
+                    return false
+                }
+                watchedItems[path] = pendingWatchedItem(file, state: "watch_checking")
+                return true
+            }
+            if batch.count != queued.count { enqueueWatchedDiscovery() }
+            guard !batch.isEmpty else { continue }
             discoveryInFlight += 1
             let generation = watchGeneration
-            let forced = batch.map(\.0).filter { discoveryForces.contains($0) }
+            let forced = batch.map(\.0).filter { discoveryForces.remove($0) != nil }
+            let forcedPaths = Set(forced)
+            for path in forced { discoveredVersions.removeValue(forKey: path) }
             let requestID = UUID()
-            discoveryRequests[requestID] = client.request(["action": "discover", "folder": folder.path, "paths": batch.map(\.0),
-                            "changed_paths": forced]) { [weak self] response in
-                guard let self else { return }
+            let versions = Dictionary(uniqueKeysWithValues: batch)
+            discoveryRequests[requestID] = client.request(["action": "discover", "folder": folder.path,
+                "paths": batch.map(\.0), "changed_paths": forced, "stable_versions": versions]) { [weak self] response in
+                guard let self, self.watchGeneration == generation else { return }
                 self.discoveryRequests.removeValue(forKey: requestID)
-                guard self.watchGeneration == generation else { return }
                 self.discoveryInFlight -= 1
-                guard self.watcher.folder?.path == folder.path else { return }
+                let items: [String: WatchedDiscovery]
+                let failure: String
+                switch response {
+                case .success(let value):
+                    let rows = (value["items"] as? [[String: Any]] ?? []).compactMap { raw -> WatchedDiscovery? in
+                        var row = raw
+                        if row["version_key"] == nil, let path = row["path"] as? String, row["state"] as? String == "unavailable" {
+                            row["version_key"] = versions[path]
+                        }
+                        return WatchedDiscovery(row)
+                    }
+                    items = Dictionary(rows.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
+                    failure = "未能读取文件检查结果，请重试。"
+                case .failure(let error):
+                    items = [:]
+                    failure = error.localizedDescription
+                }
+                var queueChanged = false
                 for (path, version) in batch {
                     self.discoveryQueuedPaths.remove(path)
-                    self.discoveryForces.remove(path)
-                    guard self.watchedSnapshots[path]?.version == version else { continue }
-                    switch response {
-                    case .success(let value):
-                        let raw = value["items"] as? [[String: Any]] ?? []
-                        if let item = raw.first(where: { $0["path"] as? String == path }).flatMap(WatchedDiscovery.init) {
-                            if let fenced = self.watchDeletionFences[path], fenced != item.versionKey {
-                                self.watchDeletionFences.removeValue(forKey: path)
-                                self.watchIgnorePending.remove(path)
-                                self.watchIgnoreErrors.removeValue(forKey: path)
-                                self.persistWatchDeletionFences()
-                            }
-                            self.watchedItems[path] = item
-                            if item.state == "copying" {
-                                let retries = (self.discoveryRetryCounts[path] ?? 0) + 1
-                                self.discoveryRetryCounts[path] = retries
-                                if WatchedDiscoveryRetry.shouldSchedule(after: retries) {
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + WatchedDiscoveryRetry.interval) { [weak self] in
-                                        guard let self, self.watchedSnapshots[path]?.version == version,
-                                              !self.discoveryQueuedPaths.contains(path) else { return }
-                                        self.discoveringPaths.append((path, version)); self.discoveryQueuedPaths.insert(path)
-                                        self.drainDiscovery(folder: folder)
-                                    }
-                                } else if self.manualVerifyRemaining.remove(path) != nil {
-                                    self.manualVerifyUnready += 1; self.updateManualVerifyProgress()
-                                }
-                            } else {
-                                self.discoveryRetryCounts.removeValue(forKey: path)
-                                self.discoveredVersions[path] = version
-                                if self.manualVerifyRemaining.remove(path) != nil { self.updateManualVerifyProgress() }
-                                if item.state == "ready" {
-                                    // Legacy incomplete queue rows predate watched-version
-                                    // identities. Bind their current bytes once, so unchanged
-                                    // cancelled/failed work requires the explicit Retry action.
-                                    for index in self.queue.items.indices where self.queue.items[index].url.standardizedFileURL.path == path &&
-                                        self.queue.items[index].watchedVersionKey == nil &&
-                                        ["waiting", "checking", "processing", "failed", "cancelled"].contains(self.queue.items[index].state) {
-                                        self.queue.items[index].watchedVersionKey = item.versionKey
-                                    }
-                                    self.persist()
-                                }
-                            }
-                        }
-                    case .failure(let error):
-                        self.watchedItems[path] = WatchedDiscovery(["path": path,
-                            "filename": URL(fileURLWithPath: path).lastPathComponent,
-                            "state": "unavailable", "version_key": version,
-                            "message": error.localizedDescription])
+                    guard let file = self.watchedSnapshots[path], file.version == version,
+                          file.unavailableReason == nil, !self.discoveryForces.contains(path) else { continue }
+                    guard let item = items[path] else {
+                        self.watchedItems[path] = self.pendingWatchedItem(file, state: "failed", message: failure)
                         self.discoveredVersions[path] = version
-                        if self.manualVerifyRemaining.remove(path) != nil {
-                            self.manualVerifyUnready += 1; self.updateManualVerifyProgress()
+                        self.discoveryRetryCounts.removeValue(forKey: path)
+                        continue
+                    }
+                    if item.state == "copying" {
+                        self.scheduleWatchedRetry(file, folder: folder, generation: generation, force: forcedPaths.contains(path))
+                        continue
+                    }
+                    self.discoveryRetryCounts.removeValue(forKey: path)
+                    self.discoveredVersions[path] = version
+                    if let fenced = self.watchDeletionFences[path], fenced != item.versionKey,
+                       ["ready", "processed", "processed_candidate", "ignored"].contains(item.state) {
+                        self.watchDeletionFences.removeValue(forKey: path)
+                        self.watchIgnorePending.remove(path)
+                        self.watchIgnoreErrors.removeValue(forKey: path)
+                        self.persistWatchDeletionFences()
+                    }
+                    self.watchedItems[path] = item
+                    if item.state == "ready" {
+                        // Bind old incomplete queue rows to the checked bytes.
+                        for index in self.queue.items.indices where self.queue.items[index].url.standardizedFileURL.path == path &&
+                            self.queue.items[index].watchedVersionKey == nil &&
+                            ["waiting", "checking", "processing", "failed", "cancelled"].contains(self.queue.items[index].state) {
+                            self.queue.items[index].watchedVersionKey = item.versionKey
+                            queueChanged = true
                         }
                     }
                 }
-                self.rebuildRows(); self.drainDiscovery(folder: folder)
+                if queueChanged { self.persist() }
+                self.enqueueWatchedDiscovery()
+                self.drainDiscovery(folder: folder)
+                self.rebuildRows()
+            }
+        }
+    }
+
+    private func scheduleWatchedRetry(_ file: WatchedFileSnapshot, folder: URL, generation: Int, force: Bool) {
+        let path = file.path
+        let attempts = (discoveryRetryCounts[path] ?? 0) + 1
+        guard WatchedDiscoveryRetry.shouldSchedule(after: attempts) else {
+            discoveryRetryCounts.removeValue(forKey: path)
+            discoveredVersions[path] = file.version
+            watchedItems[path] = pendingWatchedItem(file, state: "failed", message: "文件仍未稳定，请等待复制结束后重试。")
+            return
+        }
+        discoveryRetryCounts[path] = attempts
+        if force { discoveryForces.insert(path) }
+        watchedItems[path] = pendingWatchedItem(file, state: "copying")
+        DispatchQueue.main.asyncAfter(deadline: .now() + WatchedDiscoveryRetry.interval) { [weak self] in
+            guard let self, self.watchGeneration == generation,
+                  self.watchedSnapshots[path]?.version == file.version,
+                  self.discoveryRetryCounts[path] == attempts else { return }
+            self.discoveryRetryCounts.removeValue(forKey: path)
+            // Carry retry count through dispatch until the response arrives.
+            if let snapshot = self.watchedSnapshots[path], snapshot.stable, self.needsWatchedDiscovery(snapshot),
+               self.discoveryQueuedPaths.insert(path).inserted {
+                self.discoveryRetryCounts[path] = attempts
+                self.discoveringPaths.insert((path, file.version), at: 0)
+                self.watchedItems[path] = self.pendingWatchedItem(file, state: "watch_queued")
+                self.drainDiscovery(folder: folder)
+                self.rebuildRows()
             }
         }
     }
